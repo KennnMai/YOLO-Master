@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from .authority import EXPORTED_ROUTER_HOST_TOPK_AUTHORITY
 from ultralytics.nn.modules.topk_contract import (
     DEADBAND_LOWEST_ID_TOPK,
     LEGACY_PRIORITY_BIAS_TOPK,
@@ -213,6 +214,7 @@ class ORTRouterTorchExpertAdapter(nn.Module):
         self._mismatch_eager_route_margins: list[float] = []
         self._mismatch_route_margin_total = 0
         self._route_mismatch_examples: list[dict] = []
+        self._authoritative_dispatch_checks = 0
 
     @property
     def router(self) -> nn.Module:
@@ -385,6 +387,7 @@ class ORTRouterTorchExpertAdapter(nn.Module):
                 f"PyTorch executed {observed_calls} experts but routing audit requires "
                 f"{audit.executed_expert_calls}"
             )
+        self._authoritative_dispatch_checks += 1
         output = self.block.out_norm(self.block.out_proj(mixture)) + x
 
         self.last_audit = audit
@@ -443,6 +446,13 @@ class ORTRouterTorchExpertAdapter(nn.Module):
             "batch_union_reduction_ratio": union_reduction,
             "onnx_expert_sessions_loaded": list(self.loaded_onnx_expert_ids),
             "checkpoint_pytorch_experts_executed": self._total_expert_calls > 0,
+            "route_authority": self.runtime.route_authority,
+            "reference_route_role": self.runtime.reference_route_role,
+            "authoritative_route_dispatch_verified": bool(
+                self.runtime.route_authority == EXPORTED_ROUTER_HOST_TOPK_AUTHORITY
+                and self._total_calls > 0
+                and self._authoritative_dispatch_checks == self._total_calls
+            ),
             "route_drift_audit_enabled": self.compare_eager_routes,
         }
         if self.compare_eager_routes:

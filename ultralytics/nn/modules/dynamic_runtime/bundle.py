@@ -14,6 +14,7 @@ from torch.nn import functional as F
 
 from ultralytics.nn.modules.topk_contract import DEFAULT_DETERMINISTIC_TOPK
 
+from .authority import EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC, EXPORTED_ROUTER_HOST_TOPK_AUTHORITY
 from .dispatch import DynamicDispatchContractError
 
 
@@ -236,6 +237,8 @@ def export_dynamic_expert_bundle(
         "module_type": f"{type(module).__module__}.{type(module).__name__}",
         "execution_semantics": "host_conditional_expert_dispatch",
         "masked_dense_allowed": False,
+        "route_authority": EXPORTED_ROUTER_HOST_TOPK_AUTHORITY,
+        "reference_route_role": EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC,
         "reference_semantics": "eager_sparse_deterministic_topk_v2",
         "num_experts": num_experts,
         "top_k": top_k,

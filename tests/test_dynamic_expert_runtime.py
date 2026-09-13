@@ -14,9 +14,14 @@ from ultralytics.nn.modules.dynamic_runtime import (
     DynamicDispatchContractError,
     DynamicDAG,
     DynamicDAGExecutor,
+    EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC,
+    EXPORTED_ROUTER_HOST_TOPK_AUTHORITY,
     ORTDynamicExpertRuntime,
     ORTRouterTorchExpertAdapter,
+    ROUTE_GATE_EXACT_REFERENCE,
+    ROUTE_GATE_EXPORTED_AUTHORITATIVE,
     dispatch_numpy_experts,
+    evaluate_route_gate,
     export_dynamic_expert_bundle,
     sparsify_topk_probabilities,
 )
@@ -126,6 +131,53 @@ def test_legacy_topk_policy_remains_explicitly_replayable():
     np.testing.assert_array_equal(legacy_ids, np.array([0, 1]))
 
 
+def test_exported_route_authority_passes_without_hiding_reference_drift():
+    blocks = [
+        {
+            "route_authority": EXPORTED_ROUTER_HOST_TOPK_AUTHORITY,
+            "authoritative_route_dispatch_verified": True,
+            "route_location_mismatch_count": 196,
+            "route_location_total": 3_945_600,
+        }
+    ]
+
+    authoritative = evaluate_route_gate(
+        blocks,
+        mode=ROUTE_GATE_EXPORTED_AUTHORITATIVE,
+        reference_audit_enabled=True,
+    )
+    exact = evaluate_route_gate(
+        blocks,
+        mode=ROUTE_GATE_EXACT_REFERENCE,
+        reference_audit_enabled=True,
+    )
+
+    assert authoritative["passed"] is True
+    assert authoritative["authoritative_route"]["passed"] is True
+    assert authoritative["eager_reference"]["exact_match"] is False
+    assert authoritative["mismatched_locations"] == 196
+    assert exact["passed"] is False
+
+
+def test_exported_route_authority_rejects_unverified_dispatch():
+    result = evaluate_route_gate(
+        [
+            {
+                "route_authority": EXPORTED_ROUTER_HOST_TOPK_AUTHORITY,
+                "authoritative_route_dispatch_verified": False,
+                "route_location_mismatch_count": 0,
+                "route_location_total": 4,
+            }
+        ],
+        mode=ROUTE_GATE_EXPORTED_AUTHORITATIVE,
+        reference_audit_enabled=True,
+    )
+
+    assert result["passed"] is False
+    assert result["authoritative_route"]["declared_by_all_blocks"] is True
+    assert result["authoritative_route"]["dispatch_verified_by_all_blocks"] is False
+
+
 def test_dynamic_dag_executes_conditionally_selected_branches():
     inputs = np.ones((2, 1, 1, 1), dtype=np.float32)
     experts = [_SpyExpert(scale) for scale in (1.0, 10.0, 100.0)]
@@ -230,6 +282,8 @@ def test_esmoe_split_onnx_runtime_matches_eager_and_loads_one_expert(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["execution_semantics"] == "host_conditional_expert_dispatch"
     assert manifest["masked_dense_allowed"] is False
+    assert manifest["route_authority"] == EXPORTED_ROUTER_HOST_TOPK_AUTHORITY
+    assert manifest["reference_route_role"] == EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC
     assert manifest["routing_granularity"] == "sample"
     assert manifest["router_output_semantics"] == "dense_probabilities_host_topk"
     assert manifest["host_topk_tie_break"] == DEFAULT_DETERMINISTIC_TOPK
@@ -305,6 +359,8 @@ def test_ort_router_torch_experts_adapter_uses_checkpoint_experts_without_loadin
     assert adapter.loaded_onnx_expert_ids == ()
     summary = adapter.execution_summary()
     assert summary["checkpoint_pytorch_experts_executed"] is True
+    assert summary["route_authority"] == EXPORTED_ROUTER_HOST_TOPK_AUTHORITY
+    assert summary["authoritative_route_dispatch_verified"] is True
     assert summary["sample_pair_reduction_ratio"] == pytest.approx(2 / 3)
     assert summary["route_location_mismatch_count"] == 0
     assert adapter.runtime.last_dense_routing_probabilities is not None

@@ -11,6 +11,7 @@ import numpy as np
 
 from ultralytics.nn.modules.topk_contract import LEGACY_PRIORITY_BIAS_TOPK, SUPPORTED_DETERMINISTIC_TOPK
 
+from .authority import EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC, EXPORTED_ROUTER_HOST_TOPK_AUTHORITY
 from .bundle import BUNDLE_SCHEMA_VERSION
 from .dispatch import (
     DynamicDispatchAudit,
@@ -55,6 +56,13 @@ class ORTDynamicExpertRuntime:
             raise DynamicDispatchContractError("manifest does not declare host conditional expert dispatch")
         if self.manifest.get("masked_dense_allowed") is not False:
             raise DynamicDispatchContractError("manifest must explicitly forbid masked-dense execution")
+        route_authority = self.manifest.get("route_authority")
+        if route_authority not in (None, EXPORTED_ROUTER_HOST_TOPK_AUTHORITY):
+            raise DynamicDispatchContractError(f"unsupported manifest route authority: {route_authority!r}")
+        self.route_authority = route_authority or "legacy_unspecified"
+        self.reference_route_role = str(
+            self.manifest.get("reference_route_role", EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC)
+        )
         tie_break = str(self.manifest.get("host_topk_tie_break", LEGACY_PRIORITY_BIAS_TOPK))
         if tie_break not in SUPPORTED_DETERMINISTIC_TOPK:
             raise DynamicDispatchContractError(f"unsupported manifest Top-K policy: {tie_break!r}")

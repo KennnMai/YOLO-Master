@@ -16,6 +16,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ultralytics.nn.modules.dynamic_runtime import (
+    EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC,
+    EXPORTED_ROUTER_HOST_TOPK_AUTHORITY,
     ORTDynamicExpertRuntime,
     dispatch_numpy_experts,
     export_dynamic_expert_bundle,
@@ -326,6 +328,8 @@ def main() -> None:
             "routing_granularity": bundle["routing_granularity"],
             "num_experts": bundle["num_experts"],
             "top_k": bundle["top_k"],
+            "route_authority": bundle["route_authority"],
+            "reference_route_role": bundle["reference_route_role"],
             "host_topk_tie_break": bundle["host_topk_tie_break"],
             "host_topk_tie_tolerance": bundle["host_topk_tie_tolerance"],
             "compute_reduction_guaranteed_per_sample": bundle[
@@ -382,6 +386,8 @@ def main() -> None:
         ),
         "execution_semantics": "host_conditional_expert_dispatch",
         "masked_dense_allowed": False,
+        "route_authority": EXPORTED_ROUTER_HOST_TOPK_AUTHORITY,
+        "reference_route_role": EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC,
         "scope": "routed_blocks_only",
         "checkpoint": {
             "path": str(checkpoint_path),

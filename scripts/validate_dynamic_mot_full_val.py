@@ -23,7 +23,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from export_dynamic_blocks_from_checkpoint import load_model, sha256
 from ultralytics.models.yolo.detect import DetectionValidator
-from ultralytics.nn.modules.dynamic_runtime import ORTRouterTorchExpertAdapter
+from ultralytics.nn.modules.dynamic_runtime import (
+    EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC,
+    EXPORTED_ROUTER_HOST_TOPK_AUTHORITY,
+    ROUTE_GATE_EXACT_REFERENCE,
+    ROUTE_GATE_EXPORTED_AUTHORITATIVE,
+    ROUTE_GATE_REPORT_ONLY,
+    SUPPORTED_ROUTE_GATE_MODES,
+    ORTRouterTorchExpertAdapter,
+    evaluate_route_gate,
+)
 from validate_full_yolo_hybrid_dynamic_runtime import replace_submodule
 
 
@@ -116,7 +125,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--require-exact-route",
         action="store_true",
-        help="Fail if any ORT-router Top-K location differs from the eager checkpoint router",
+        help="Compatibility alias for --route-gate-mode exact_reference",
+    )
+    parser.add_argument(
+        "--route-gate-mode",
+        choices=tuple(sorted(SUPPORTED_ROUTE_GATE_MODES)),
+        help=(
+            "Route acceptance contract: exact eager-reference parity, exported-router authority, "
+            "or report-only diagnostics. The legacy --require-exact-route flag selects exact_reference."
+        ),
     )
     parser.add_argument(
         "--skip-route-drift-audit",
@@ -225,8 +242,13 @@ def main() -> int:
         raise ValueError("--imgsz/--batch must be positive and --workers must be nonnegative")
     if args.map_tolerance_pct_points < 0:
         raise ValueError("--map-tolerance-pct-points must be nonnegative")
-    if args.require_exact_route and args.skip_route_drift_audit:
-        raise ValueError("--require-exact-route cannot be combined with --skip-route-drift-audit")
+    if args.require_exact_route and args.route_gate_mode is not None:
+        raise ValueError("--require-exact-route cannot be combined with --route-gate-mode")
+    route_gate_mode = args.route_gate_mode or (
+        ROUTE_GATE_EXACT_REFERENCE if args.require_exact_route else ROUTE_GATE_REPORT_ONLY
+    )
+    if route_gate_mode == ROUTE_GATE_EXACT_REFERENCE and args.skip_route_drift_audit:
+        raise ValueError("exact_reference route gating cannot be combined with --skip-route-drift-audit")
 
     # The eager checkpoint does not need ORT, but phase 2 does. Check ORT now
     # so a missing package fails immediately instead of after all 548 eager images.
@@ -240,6 +262,13 @@ def main() -> int:
         raise ValueError("model manifest does not describe routed checkpoint blocks")
     if model_manifest.get("status") == "FAILED":
         raise ValueError("refusing a failed dynamic-block manifest")
+    if (
+        route_gate_mode == ROUTE_GATE_EXPORTED_AUTHORITATIVE
+        and model_manifest.get("route_authority") != EXPORTED_ROUTER_HOST_TOPK_AUTHORITY
+    ):
+        raise ValueError(
+            "exported_authoritative mode requires bundles re-exported with explicit route authority"
+        )
     checkpoint_hash = sha256(checkpoint)
     if checkpoint_hash != model_manifest["checkpoint"]["sha256"]:
         raise ValueError("checkpoint SHA256 does not match dynamic model manifest")
@@ -308,15 +337,21 @@ def main() -> int:
     hybrid_map = hybrid["metrics"]["metrics/mAP50-95(B)"]
     delta_pct_points = (hybrid_map - eager_map) * 100.0
     precision_gate = abs(delta_pct_points) <= args.map_tolerance_pct_points
-    total_route_mismatches = sum(item.get("route_location_mismatch_count", 0) for item in block_summaries)
-    total_route_locations = sum(item.get("route_location_total", 0) for item in block_summaries)
+    route_gate_result = evaluate_route_gate(
+        block_summaries,
+        mode=route_gate_mode,
+        reference_audit_enabled=not args.skip_route_drift_audit,
+    )
+    total_route_mismatches = route_gate_result["mismatched_locations"]
     route_drift_observed = total_route_mismatches > 0
-    route_gate = not args.require_exact_route or not route_drift_observed
+    route_gate = bool(route_gate_result["passed"])
     conditional_observed = any(item["sample_pair_reduction_ratio"] > 0.0 for item in block_summaries)
     dynamic_gate = conditional_observed and all(item["calls"] > 0 for item in block_summaries)
     passed = precision_gate and route_gate and dynamic_gate and eager["images"] >= 500 and hybrid["images"] >= 500
     if not passed:
         status = "FAIL"
+    elif route_drift_observed and route_gate_mode == ROUTE_GATE_EXPORTED_AUTHORITATIVE:
+        status = "PASS_WITH_REFERENCE_ROUTE_DRIFT"
     elif route_drift_observed:
         status = "PASS_WITH_ROUTE_DRIFT"
     else:
@@ -330,6 +365,8 @@ def main() -> int:
         "model_manifest": {"path": str(model_manifest_path), "status": model_manifest.get("status")},
         "data": str(data),
         "execution_semantics": "host_ort_router_conditional_pytorch_checkpoint_experts",
+        "route_authority": EXPORTED_ROUTER_HOST_TOPK_AUTHORITY,
+        "reference_route_role": EAGER_CHECKPOINT_ROUTE_DIAGNOSTIC,
         "runtime_preflight": ort_preflight,
         "masked_dense_allowed": False,
         "not_a_full_export": True,
@@ -353,14 +390,7 @@ def main() -> int:
             "tolerance_percentage_points": args.map_tolerance_pct_points,
             "passed": precision_gate,
         },
-        "route_gate": {
-            "audit_enabled": not args.skip_route_drift_audit,
-            "exact_route_required": args.require_exact_route,
-            "mismatched_locations": total_route_mismatches,
-            "total_locations": total_route_locations,
-            "mismatch_ratio": total_route_mismatches / total_route_locations if total_route_locations else 0.0,
-            "passed": route_gate,
-        },
+        "route_gate": route_gate_result,
         "dynamic_execution_gate": {
             "all_blocks_executed": all(item["calls"] > 0 for item in block_summaries),
             "at_least_one_block_observed_sample_pair_reduction": conditional_observed,
@@ -372,6 +402,7 @@ def main() -> int:
         "limitations": [
             "The outer YOLO graph and experts remain PyTorch; this is not a complete exported model.",
             "ORT router tensors cross CPU/NumPy and synchronize with CUDA experts; timing is diagnostic only.",
+            "Eager checkpoint route differences remain reported but are diagnostic under exported_authoritative mode.",
             "This run does not provide TensorRT plugin correctness or end-to-end acceleration evidence.",
         ],
     }
