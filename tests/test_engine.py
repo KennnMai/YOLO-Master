@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tests import MODEL, SOURCE, TASK_MODEL_DATA
+from tests.dataset_fixtures import tiny_coco_multitask_yaml
 from ultralytics import YOLO
 from ultralytics.cfg import get_cfg
 from ultralytics.engine.exporter import Exporter
@@ -127,6 +128,9 @@ def test_task(trainer_cls, validator_cls, predictor_cls, data, model, weights):
 @pytest.mark.parametrize("task,weight,data", TASK_MODEL_DATA)
 def test_resume_incomplete(task, weight, data, tmp_path):
     """Test training resumes from an incomplete checkpoint."""
+    if task == "multitask":
+        # Multi-task training requires COCO-format aligned targets; no 8-image multi-task fixture ships in-repo
+        data = tiny_coco_multitask_yaml(tmp_path / "mt_data")
     train_args = {
         "data": data,
         "epochs": 2,
@@ -158,6 +162,34 @@ def test_resume_incomplete(task, weight, data, tmp_path):
     resume_model = YOLO(last_path)
     resume_model.train(resume=True, **train_args)
     assert resume_model.trainer.start_epoch == resume_model.trainer.epoch == 1, "resume test failed"
+
+
+def test_resume_allows_epoch_and_fraction_overrides(tmp_path):
+    """Resume should honor an explicit extension to training duration and dataset fraction."""
+    checkpoint = tmp_path / "last.pt"
+    torch.save(
+        {
+            "model": DetectionModel("yolo26n.yaml", verbose=False),
+            "ema": None,
+            "epoch": 0,
+            "train_args": {**vars(DEFAULT_CFG), "data": "coco8.yaml", "epochs": 1, "fraction": 0.01},
+        },
+        checkpoint,
+    )
+
+    trainer = detect.DetectionTrainer(
+        overrides={
+            "resume": checkpoint,
+            "data": "coco8.yaml",
+            "epochs": 2,
+            "fraction": 1.0,
+            "device": "cpu",
+            "workers": 0,
+        }
+    )
+
+    assert trainer.args.epochs == 2
+    assert trainer.args.fraction == 1.0
 
 
 def test_distill_resume(tmp_path: Path):
@@ -292,11 +324,14 @@ def test_checkpoint_nonfinite_ema_resync():
 
 
 def test_checkpoint_nonfinite_ema_and_model_sanitized():
-    """Test a tensor non-finite in both EMA and model is sanitized (not skipped) so the run still produces a checkpoint."""
+    """A one-time online/EMA fault is restored and replayed before saving a completed epoch."""
+    injected = False
 
     def poison_ema_and_model(trainer):
         """Force the first parameter non-finite in both the live EMA and the model (finite-loss sticky-NaN)."""
-        if trainer.ema is not None:
+        nonlocal injected
+        if trainer.ema is not None and not injected:
+            injected = True
             next(iter(trainer.ema.ema.parameters())).data.flatten()[0] = float("inf")
             next(iter(unwrap_model(trainer.model).parameters())).data.flatten()[0] = float("nan")
 

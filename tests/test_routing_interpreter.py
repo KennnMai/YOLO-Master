@@ -234,9 +234,7 @@ def test_sparse_probability_reconstruction_preserves_nontrivial_spatial_axes():
     indices = torch.tensor([0, 1]).view(1, 2, 1, 1).expand_as(weights)
 
     spatial = RoutingInterpreter._router_probabilities((weights, indices, {}), num_experts=3)
-    image_level = RoutingInterpreter._router_probabilities(
-        (weights[:, :, :1], indices[:, :, :1], {}), num_experts=3
-    )
+    image_level = RoutingInterpreter._router_probabilities((weights[:, :, :1], indices[:, :, :1], {}), num_experts=3)
 
     assert spatial is not None and spatial.shape == (1, 3, 3, 1)
     assert image_level is not None and image_level.shape == (1, 3)
@@ -257,6 +255,25 @@ def test_causal_analysis_forces_expert_and_restores_router():
     assert model.training is True
     assert model.routed.training is True
     assert torch.allclose(natural, restored)
+
+
+def test_dataset_collapse_usage_is_weighted_by_samples_not_batches():
+    batches = [torch.ones(2, 1, 3, 4), -torch.ones(1, 1, 3, 4)]
+
+    _, _, collapse = RoutingInterpreter(ToyModel()).run_dataset_analysis(batches)
+
+    positive = torch.softmax(torch.tensor([1.0, -1.0]), dim=0)
+    negative = positive.flip(0)
+    expected = (2 * positive + negative) / 3
+    assert collapse["routed"].expert_usage == pytest.approx(expected.tolist())
+
+
+def test_single_sample_dataset_metrics_have_finite_zero_spread():
+    _, differentiation, _ = RoutingInterpreter(ToyModel()).run_dataset_analysis([torch.ones(1, 1, 3, 4)])
+
+    metrics = differentiation["routed"]
+    assert metrics.std_kl_divergence == pytest.approx(0.0)
+    assert metrics.std_weight_spread == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(
@@ -289,9 +306,7 @@ def test_capture_routing_supports_real_mixture_families(module, batch, expected_
 
 def test_capture_routing_reconstructs_optimized_moe_sparse_topk_probabilities():
     module = OptimizedMOE(16, 16, num_experts=4, top_k=2)
-    heatmap = RoutingInterpreter(module).capture_routing(
-        torch.randn(2, 16, 4, 5), layer_name="<root>"
-    )["<root>"]
+    heatmap = RoutingInterpreter(module).capture_routing(torch.randn(2, 16, 4, 5), layer_name="<root>")["<root>"]
 
     assert heatmap.probabilities.shape == (2, 4)
     assert torch.allclose(heatmap.probabilities.sum(dim=1), torch.ones(2), atol=1e-6)
@@ -371,8 +386,6 @@ def test_cli_writes_report_and_heatmap(monkeypatch, tmp_path):
 
     assert exit_code == 0
     assert (output_dir / "routed_confidence_heatmap.png").stat().st_size > 0
-    assert report["visualizations"]["routed"]["confidence_heatmap"].endswith(
-        "routed_confidence_heatmap.png"
-    )
+    assert report["visualizations"]["routed"]["confidence_heatmap"].endswith("routed_confidence_heatmap.png")
     assert list(report["heatmaps"]) == ["routed"]
     assert [summary["layer_name"] for summary in report["summaries"]] == ["routed"]

@@ -6,7 +6,12 @@ import torch
 from torch import nn
 
 from ultralytics.engine.extensions import AdapterRuntimeController
-from ultralytics.engine.trainer import BaseTrainer, validate_adapter_configuration
+from ultralytics.engine.extensions.recovery import TrainingRecoveryController
+from ultralytics.engine.trainer import (
+    BaseTrainer,
+    _reset_optimizer_accumulation_after_recovery,
+    validate_adapter_configuration,
+)
 from ultralytics.nn.peft.molora import MoLoRAConfig, MoLoRALayer, get_peft_molora_model
 from ultralytics.utils.errors import MoERouterError
 from ultralytics.utils.patches import torch_load
@@ -52,6 +57,43 @@ class RTDETRSmokeModel(ImageSmokeModel):
 
     def forward(self, x):
         return self.decoder(super().forward(x))
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("mps", marks=pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")),
+    ],
+)
+def test_batched_finite_check_detects_nonfinite_tensors(device):
+    tensors = [torch.ones(3, device=device), torch.tensor([float("nan")], device=device)]
+
+    assert TrainingRecoveryController.tensors_are_finite(tensors) is False
+
+
+def test_batched_finite_check_uses_foreach_kernel(monkeypatch):
+    tensors = [torch.ones(3), torch.ones(2)]
+    finite_check = MagicMock(wraps=torch._amp_foreach_non_finite_check_and_unscale_)
+    monkeypatch.setattr(torch, "_amp_foreach_non_finite_check_and_unscale_", finite_check)
+
+    assert TrainingRecoveryController.tensors_are_finite(tensors) is True
+    finite_check.assert_called_once()
+
+
+def test_batched_state_finite_check_handles_nested_optimizer_state():
+    state = {"state": {0: {"exp_avg": torch.ones(3), "exp_avg_sq": torch.tensor([float("inf")])}}}
+
+    assert TrainingRecoveryController.state_is_finite_batched(state) is False
+
+
+def test_finite_ema_resync_check_avoids_per_tensor_finite_checks(monkeypatch):
+    source, target = nn.Linear(3, 2), nn.Linear(3, 2)
+    finite_check = MagicMock(wraps=TrainingRecoveryController.state_is_finite)
+    monkeypatch.setattr(TrainingRecoveryController, "state_is_finite", finite_check)
+
+    assert TrainingRecoveryController.replace_nonfinite_tensors(target, source) is True
+    finite_check.assert_not_called()
 
 
 def test_adapter_configuration_rejects_lora_and_molora_together():
@@ -122,7 +164,10 @@ def recovery_trainer(tmp_path, loss=1.0, fitness=0.0, best_fitness=0.4):
 
 def write_healthy(path):
     model = nn.Linear(1, 1)
-    torch.save({"model": model, "ema": nn.Linear(1, 1), "optimizer": None, "scaler": None, "best_fitness": 0.4, "updates": 0}, path)
+    torch.save(
+        {"model": model, "ema": nn.Linear(1, 1), "optimizer": None, "scaler": None, "best_fitness": 0.4, "updates": 0},
+        path,
+    )
 
 
 def test_nccl_skips_nonpersistent_cpu():
@@ -212,7 +257,9 @@ def test_recovery_controller_resyncs_nonfinite_ema_from_online_model(tmp_path):
 
 def test_recovery_rejects_legacy_checkpoint_without_online_model(tmp_path):
     t = recovery_trainer(tmp_path, loss=float("nan"))
-    torch.save({"ema": nn.Linear(1, 1), "optimizer": None, "scaler": None, "best_fitness": 0.4, "updates": 0}, t.healthy)
+    torch.save(
+        {"ema": nn.Linear(1, 1), "optimizer": None, "scaler": None, "best_fitness": 0.4, "updates": 0}, t.healthy
+    )
     with pytest.raises(RuntimeError, match="lacks online model state"):
         t._handle_nan_recovery(0)
 
@@ -237,6 +284,20 @@ def test_recovery_clears_non_checkpoint_moe_registry(tmp_path):
         assert not list(MOE_LOSS_REGISTRY.items())
     finally:
         MOE_LOSS_REGISTRY.clear()
+
+
+def test_recovery_aux_finite_check_uses_canonical_records():
+    from ultralytics.engine.extensions.recovery import TrainingRecoveryController
+    from ultralytics.nn.modules.moe._common import MOE_LOSS_REGISTRY
+    from ultralytics.nn.modules.routing_protocol import clear_aux_records, publish_aux_loss
+
+    clear_aux_records(step=91)
+    module = nn.Linear(1, 1).train()
+    MOE_LOSS_REGISTRY[module] = torch.tensor(float("nan"))
+    assert TrainingRecoveryController.aux_state_is_finite()
+
+    publish_aux_loss(module, torch.tensor(float("nan"), requires_grad=True), kind="moe", training=True)
+    assert not TrainingRecoveryController.aux_state_is_finite()
 
 
 def test_validate_skips_nonfinite_ema_and_marks_recovery():
@@ -289,6 +350,18 @@ def test_nonfinite_amp_recovery_switches_to_fp32(tmp_path):
     assert t._handle_nan_recovery(0) is True
     assert t.amp is False
     assert t.scaler.is_enabled() is False
+
+
+def test_epoch_recovery_restarts_optimizer_accumulation_cursor():
+    """An epoch replay must not inherit the completed pass's last optimizer-step index."""
+    model = nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    model(torch.ones(1, 1)).sum().backward()
+
+    last_opt_step = _reset_optimizer_accumulation_after_recovery(optimizer)
+
+    assert last_opt_step == -1
+    assert all(parameter.grad is None for parameter in model.parameters())
 
 
 def test_nonfinite_gradient_skips_optimizer_on_all_ranks():
@@ -411,9 +484,7 @@ def test_checkpoint_restore_tolerates_missing_lazy_ema_buffer():
     old_ema = nn.Linear(1, 1)
 
     t.model.register_buffer("_mixture_loss_ema_buf", torch.tensor([1.0, 0.1, 0.1]))
-    t._load_checkpoint_state(
-        {"ema": old_ema, "optimizer": None, "scaler": None, "best_fitness": 0.0, "updates": 0}
-    )
+    t._load_checkpoint_state({"ema": old_ema, "optimizer": None, "scaler": None, "best_fitness": 0.0, "updates": 0})
 
     # Legacy three-slot EMA state is migrated when the latent loss channel is
     # introduced; the original values remain unchanged in their slots.
@@ -421,6 +492,24 @@ def test_checkpoint_restore_tolerates_missing_lazy_ema_buffer():
         t.ema.ema._mixture_loss_ema_buf,
         torch.tensor([1.0, 0.1, 0.1, 0.1]),
     )
+
+
+def test_checkpoint_restore_migrates_legacy_three_slot_ema_state():
+    t = object.__new__(BaseTrainer)
+    t.model = nn.Linear(1, 1)
+    t.model.register_buffer("_mixture_loss_ema_buf", torch.tensor([1.0, 0.1, 0.1, 0.1]))
+    t.ema = ModelEMA(t.model)
+    t.optimizer = torch.optim.SGD(t.model.parameters(), lr=0.01)
+    t.scaler = torch.amp.GradScaler("cuda", enabled=False)
+    old_ema = nn.Linear(1, 1)
+    old_ema.register_buffer("_mixture_loss_ema_buf", torch.tensor([2.0, 0.2, 0.3]))
+
+    t._load_checkpoint_state({"ema": old_ema, "optimizer": None, "scaler": None, "best_fitness": 0.0, "updates": 7})
+
+    expected = torch.tensor([2.0, 0.2, 0.3, 0.1])
+    assert torch.equal(t.model._mixture_loss_ema_buf, expected)
+    assert torch.equal(t.ema.ema._mixture_loss_ema_buf, expected)
+    assert t.ema.updates == 7
 
 
 def test_healthy_checkpoint_rejects_nonfinite_state_and_preserves_prior(tmp_path):
@@ -637,7 +726,9 @@ def test_bootstrap_failure_never_creates_unverified_checkpoint(tmp_path):
     t = bootstrap_trainer(tmp_path)
     with torch.no_grad():
         t.model.weight.fill_(float("nan"))
-    with patch("ultralytics.engine.trainer.RANK", -1), pytest.raises(RuntimeError, match="Initial training state is nonfinite"):
+    with patch("ultralytics.engine.trainer.RANK", -1), pytest.raises(
+        RuntimeError, match="Initial training state is nonfinite"
+    ):
         t._bootstrap_healthy_checkpoint()
     assert not t.healthy.exists()
 

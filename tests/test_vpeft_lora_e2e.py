@@ -36,6 +36,14 @@ def test_vpeft_backend_compiles_plan_and_injects_selected_targets():
     assert all(item["rank"] > 0 for item in plan["targets"])
 
 
+def test_lora_config_from_args_preserves_rank_pattern():
+    rank_pattern = {"model.0": 2, "model.1": 4}
+
+    config = LoRAConfig.from_args(lora_rank_pattern=rank_pattern)
+
+    assert config.rank_pattern == rank_pattern
+
+
 def test_vpeft_refusal_falls_back_to_legacy_targets():
     model = apply_lora(
         _model(),
@@ -149,3 +157,53 @@ def test_active_vpeft_plan_does_not_run_legacy_planner(monkeypatch):
 
     assert wrapped.lora_target_modules == ["0"]
     assert wrapped[0].r == 2
+
+
+def test_vpeft_internal_failure_falls_back_with_structured_metadata(monkeypatch):
+    import ultralytics.utils.lora.api as api
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("planner bug")
+
+    monkeypatch.setattr(api, "_build_vpeft_placement_plan", fail)
+    model = apply_lora(
+        _model(),
+        LoRAConfig(r=4, alpha=8, backend="fallback", planner_backend="vpeft"),
+    )
+
+    assert model.lora_runtime_metadata["vpeft_fallback"] == {
+        "category": "internal",
+        "reason": "planner bug",
+        "message": "planner bug",
+        "exception_type": "RuntimeError",
+    }
+    assert model.lora_runtime_metadata["planner_result"]["status"] == "FALLBACK"
+    assert model.lora_runtime_metadata["planner_result"]["reason"]["category"] == "internal"
+
+
+def test_vpeft_strict_reraises_internal_failure(monkeypatch):
+    import ultralytics.utils.lora.api as api
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("planner bug")
+
+    monkeypatch.setattr(api, "_build_vpeft_placement_plan", fail)
+    with pytest.raises(RuntimeError, match="planner bug"):
+        apply_lora(
+            _model(),
+            LoRAConfig(r=4, alpha=8, backend="fallback", planner_backend="vpeft", vpeft_strict=True),
+        )
+
+
+def test_vpeft_strict_reraises_configuration_failure(monkeypatch):
+    import ultralytics.utils.lora.api as api
+
+    def fail(*args, **kwargs):
+        raise ValueError("unsupported solver")
+
+    monkeypatch.setattr(api, "_build_vpeft_placement_plan", fail)
+    with pytest.raises(ValueError, match="unsupported solver"):
+        apply_lora(
+            _model(),
+            LoRAConfig(r=4, alpha=8, backend="fallback", planner_backend="vpeft", vpeft_strict=True),
+        )

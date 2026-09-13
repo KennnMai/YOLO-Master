@@ -1,169 +1,385 @@
-# Edge Deployment of YOLO-Master-EsMoE-N — A Technical Report
-
-End-to-end deployment of **YOLO-Master-EsMoE-N** (VisDrone) to the edge: three export formats (ONNX / NCNN / MNN), mixed-precision INT8, a single universal C++ runtime, cross-platform builds, and accuracy/latency validation against the PyTorch original that isolates *format fidelity* from *pipeline noise*.
-
-**Repo:** https://github.com/skywalker-lt/yolo-master-edge
-
-The interesting parts of this work were not the happy paths (`model.export()` mostly works); they were the failure modes — a quantized model that silently emits **zero detections**, an mAP that reads **1.3 points low for the wrong reason**, and a 129 MB "portable" bundle that ships a **PostgreSQL client**. This report documents those, and how each was diagnosed and closed.
-
----
-
-## 1. Why the model's internals dictate the deployment strategy
-
-EsMoE-N is not a vanilla CNN. Three structural facts drove every downstream decision:
-
-1. **Mixture-of-Experts (`ES_MOE`).** At training/inference the router sparsely selects experts. That path is export-hostile (data-dependent control flow) — but `ES_MOE.forward` switches to a **dense** unroll under `torch.onnx.is_in_onnx_export()`: a static loop over the full expert list, `Conv/Pool/Softmax/Mul/Add`, no dynamic dispatch. Crucially, the dense path is also the **numerically faithful** one — it sidesteps the sparse-inference collapse that the sparse path exhibits — so exporting *improves* determinism rather than approximating it.
-2. **Area-attention (`A2C2f`).** The backbone carries transformer-style attention blocks. These reshape activations to `[1, 1600, 192]` internally, which — as we'll see — is exactly where the static-shape assumptions of downstream quantizers break.
-3. **A stride-4/8/16/32 detection head** whose classification branch produces raw logits fed through a terminal sigmoid. This branch is the single most quantization-sensitive component in the network, for a concrete reason developed in §3.
-
-The takeaway: the model exports cleanly precisely *because* the dense MoE path is standard ops — but the attention and the head are landmines for INT8 and for third-party converters.
-
-## 2. Export pipeline
-
-### 2.1 ONNX (opset 12, onnxsim)
-
-Exported to a fully **static** graph — input `images [1,3,640,640]`, output `output0 [1,14,8400]` (4 box + 10 class over 8400 anchors), 628 nodes, IR 7 — and simplified with **onnxsim**. Opset 12 was chosen deliberately as the compatibility floor: it loads unchanged under ONNXRuntime 1.18 / 1.20 / 1.27 and converts cleanly to *both* NCNN and MNN, which is the operational definition of "opset-compatible" that matters here.
-
-The export emits shape-inference warnings on the attention transposes (`.../attn/Transpose_output_0 source:{1,1600,192} target:{}`, resolved by ONNXRuntime's lenient merge). These are benign at inference — ORT resolves the shapes at runtime — but they are a **leading indicator**: any tool that requires fully static shape propagation (offline quantizers) will choke here. That prediction is borne out in §3.5.
-
-Ultralytics metadata (class names, `imgsz`, `stride`, `task`) is embedded in the ONNX `metadata_props`, which the C++ runtime later reads to auto-configure itself — no hardcoded class tables.
-
-### 2.2 NCNN via pnnx
-
-Converted through **pnnx** (PyTorch/ONNX → pnnx IR → ncnn), not the legacy `onnx2ncnn`. pnnx preserves higher-level operator semantics and emits a cleaner graph. The param file was validated structurally: magic `7767517`, **561 layers / 665 blobs**, input blob `in0`, sigmoid-terminated head. A `metadata.yaml` sidecar carries the same names/imgsz so the ncnn path is self-describing like the ONNX one.
-
-### 2.3 MNN
-
-Converted with `mnnconvert` (ONNX → MNN, 10.8 MB) — the *same* graph as ONNX/ncnn, which lets us later prove MNN correctness by direct tensor comparison against ONNX rather than a separate mAP run (§5.3).
-
-## 3. INT8 quantization — the substantive part
-
-The requirement was ≤ 1.0% mAP error under INT8 with ≥ 300 calibration images. The naive route fails silently and instructively.
-
-### 3.1 The collapse: full INT8 emits zero detections
-
-Static per-channel INT8 over the whole graph produces a model that runs, returns the correct output tensor shape, contains **no NaNs** — and detects **nothing**. mAP = 0.0000.
-
-Isolating the output tensor shows why. The box-regression channels are intact (`min 0, max 644, mean 210`, matching FP32 within noise); the **classification channels are uniformly zero** (`max = 0.0000`, zero scores above 0.001). The failure is entirely in the class head.
-
-The mechanism: the classification branch emits wide-dynamic-range **logits** consumed by a sigmoid. Per-tensor/per-channel MinMax calibration maps that wide range onto 256 INT8 levels; the small positive logits that correspond to real detections fall *below one quantization step* and round to a value whose sigmoid is ~0. The nonlinearity turns a modest quantization error on the logits into a total loss of signal. Box regression, by contrast, is a smooth linear readout with no saturating nonlinearity downstream, so it tolerates INT8 comfortably. This asymmetry — **regression robust, classification catastrophic** — is the key diagnostic.
-
-### 3.2 Localizing the sensitivity
-
-Keeping the detection head (`/model.25/`, 85 nodes) in FP32 and quantizing everything else recovers the model to **mAP50-95 = 0.1924, −1.12%** vs PyTorch — functional, but over budget. The residual loss is not uniform; it concentrates in two more structures:
-
-- **The MoE router.** Expert mixing is a softmax over routing logits. INT8 perturbs the routing weights, which re-weights the expert combination — a first-order change to the features, not a rounding error on them.
-- **Area-attention.** Attention scores pass through a softmax whose output is sensitive to input scale; INT8 on the QK path shifts the attention distribution.
-
-Both are the same failure class as the head: **a softmax/sigmoid amplifying a quantization perturbation.**
-
-### 3.3 The mixed-precision recipe
-
-The fix is node-level precision assignment: keep the three softmax/sigmoid-bearing blocks — head (`/model.25/`), attention (`/attn/`), router (`routing`), **289 nodes** — in FP32, INT8 everything else (the bulk of the convolutional compute). The progression is monotonic and diagnostic:
-
-| Configuration | mAP50-95 | Δ vs PyTorch |
-|---|---|---|
-| Full INT8 | 0.0000 | collapse |
-| head FP32 | 0.1924 | −1.12% |
-| head + attention + router FP32 | **0.1952** | **−0.84% ✅** |
-
-Final model: **10.9 → 5.4 MB (2.0×)**, mAP50-95 error **−0.84%**, inside the 1.0% budget. This is not a lucky threshold — it's the direct consequence of removing quantization from exactly the operators that violate the "smooth, non-saturating" assumption PTQ relies on.
-
-### 3.4 Calibration engineering
-
-Three non-obvious details mattered:
-
-- **Letterbox-matched calibration.** Calibrators default to a plain resize; the model is trained on **letterboxed** input. Calibrating on the wrong preprocessing biases every activation range. We pre-letterbox 300+ VisDrone *train* images (no val leakage) to 640×640 and calibrate on those, so the calibration distribution matches inference exactly.
-- **QOperator, and the opset floor.** Per-channel INT8 emits `DequantizeLinear` with an `axis` attribute, which is **only valid at opset ≥ 13**; the opset-12 export must be lifted (we upgrade to 17 in-line) or the quantized model is an invalid graph. QOperator (`QLinearConv`/`QLinearMatMul`) is chosen over QDQ for CPU execution.
-- **MinMax over Percentile.** Percentile/entropy calibration builds a histogram per activation tensor; on a graph with hundreds of attention/MoE intermediates × hundreds of images, that is pathologically slow for no accuracy gain here — the exclusions already remove the outlier-heavy layers, so MinMax on the remaining well-behaved convolutions is both faster and sufficient.
-
-### 3.5 Third-party INT8 toolchains hit the attention wall
-
-MNN's offline quantizer (`mnnquant`) aborts immediately on this model — `std::length_error: cannot create std::vector larger than max_size()` — before any calibration runs. The cause is precisely the `[1,1600,192]` attention reshapes flagged in §2.1: the quantizer allocates buffers from statically-inferred tensor dimensions, and the dynamically-shaped attention intermediate reads back as a garbage size. MNN executes this graph fine at *inference* (it resolves shapes lazily); its *quantizer* assumes static shapes. This is a limitation of the tool's static-shape contract, not of the model, and it is not configurable. The ONNXRuntime quantizer, which tolerates dynamic intermediates, is the correct vehicle for this architecture.
-
-### 3.6 Where INT8 actually pays off
-
-On x86 CPU, INT8 is *slower* than FP32 — measured at **137 ms/frame vs 49 ms for FP32 on the same host, ~2.8× slower** (7.2 vs 19.5 FPS). The QDQ/QOperator kernels don't engage INT8 SIMD paths that beat the well-tuned FP32 convolutions, and the FP32↔INT8 boundaries around the excluded blocks add conversion overhead. This is expected, not a defect: INT8's throughput win is a property of **INT8 tensor-core hardware** (TensorRT on Orin, NPUs), not of desktop CPUs. We therefore treat the ONNX INT8 result as the **accuracy proof** (−0.84%, in budget) and locate the **performance** validation on the TensorRT path (§8), where the same mixed-precision assignment maps onto tensor-core execution.
-
-## 4. The inference runtime
-
-### 4.1 Universal binary
-
-One executable (`yolomaster_edge`) with **ONNXRuntime** and **NCNN** backends behind a common interface. Backend, class names, and input size are **auto-detected** from the model (ONNX metadata / ncnn `metadata.yaml`), so the same binary serves any exported YOLO-Master variant with no recompilation. Source can be an image, a directory, a video, or a `dataset.yaml`. Sixteen robustness tests (corrupt images, missing files, imgsz mismatch, backend inference, etc.) pass on every platform.
-
-### 4.2 Preprocessing
-
-Aspect-ratio-preserving **letterbox** (min-side scale, 114 padding) → RGB `/255` NCHW, matching training. The letterbox metadata (scale, pad) is threaded through decode so boxes map back to original-image pixel coordinates in float, with no intermediate integer rounding.
-
-### 4.3 Decode, NMS, and the mAP-parity subtlety
-
-An early version of the C++ pipeline read **1.3 mAP points low** despite bit-accurate inference. The cause was in the decode, not the model: ultralytics `val` uses **`multi_label=True`** — one detection per class scoring above threshold per anchor, not a single argmax. Reproducing that (a `--multi-label` mode) recovered the gap exactly (0.3375 → 0.3494 mAP50). NMS is **per-class** (`agnostic=False`), implemented with a class-offset trick (shift each box by `class_id × 8192` so cross-class boxes never suppress each other), and capped at 300 detections. Default `conf` is low, appropriate to VisDrone's small/dense objects; `--conf`/`--iou` are tunable per deployment.
-
-### 4.4 Dependency surgery for a real portable bundle
-
-The first self-contained Linux bundle was **231 shared libraries, 129 MB** — because Ubuntu's `libopencv_imgcodecs` links **GDAL**, which transitively pulls in PostgreSQL (`libpq`), MySQL, `libpoppler` (PDF), HDF5, and the GIS stack, and `libopencv_dnn` pulls protobuf. An object detector does not need a Postgres client. We removed both by replacing `cv::imread`/`imwrite` with **stb_image** (single-header) and `cv::dnn::NMSBoxes`/`blobFromImage` with a hand-written NMS and a manual NCHW pack. That drops the OpenCV surface to **core + imgproc only**: **231 → 10 libraries, 129 → 35 MB**, at a cost of a **0.087%** detection-count difference (stb vs OpenCV JPEG decoders diverge by sub-LSB pixel values on a handful of borderline boxes) — well inside tolerance. On Linux the binary is `$ORIGIN`-rpath'd and verified to run with no `LD_LIBRARY_PATH`; on Windows the MSVC runtime is bundled so targets need no VC++ Redistributable.
-
-## 5. Accuracy validation
-
-### 5.1 Methodology — one metric harness for everything
-
-Every model — PyTorch, ONNX, NCNN, MNN, INT8 — is scored through a single path: predictions at **conf 0.001, NMS iou 0.7, multi-label, cap 300** (ultralytics `val` settings), fed to ultralytics' own `DetMetrics` + `box_iou` + `match_predictions` (`eval_map.py`). This guarantees the numbers are comparable across formats and directly comparable to the ultralytics reference, rather than four subtly different mAP implementations. ONNX/ncnn predictions are produced by the C++ runtime (`--save-txt`); MNN by a Python runner replicating the identical decode.
-
-### 5.2 Results — 548 val images (> 500 requirement)
-
-| Model | mAP50 | mAP50-95 | Δ mAP50-95 vs PyTorch |
-|---|---|---|---|
-| **PyTorch (reference)** | 0.3504 | 0.2036 | — |
-| ONNX | 0.3495 | 0.2034 | **−0.02%** |
-| NCNN | 0.3495 | 0.2034 | **−0.02%** |
-| MNN  | 0.3495 | 0.2034 | **−0.02%** |
-| INT8 (mixed) | 0.3377 | 0.1952 | **−0.84%** |
-
-All three FP32 export formats land on **identical** mAP (0.2034) — as they should, being the same graph — at **−0.02%** from PyTorch, 25× inside the 0.5% target. INT8 is **−0.84%**, inside the 1.0% target. (The INT8 mAP50 drop is larger, −1.27%, reflecting slightly softer classification confidences at INT8; the budget is defined on mAP50-95, which passes.)
-
-### 5.3 Numerical parity — isolating format from pipeline
-
-Because the FP32 formats share a graph, we verify fidelity directly rather than only through mAP. Feeding **identical letterboxed inputs** to MNN and the source ONNX across 100 val images yields **max|Δ| = 0.096, mean|Δ| = 9.7e-05** on the raw `[1,14,8400]` output. The max is a single box-coordinate least-significant bit (coordinates run to ~640; 0.096 px is nothing); the mean is negligible. Detection counts over the full set are effectively equal (ONNX 157,464 vs ncnn 157,465 at conf 0.001). This distinguishes *format equivalence* from *coincidentally similar mAP*.
-
-The same discipline caught a **false alarm** on the CUDA path: a raw `max|Δ| = 2.31` looked alarming until it was traced to FP32 box-coordinate variance in a single anchor — functional mAP was identical. A naive "max-abs-diff < ε" gate would have failed a correct model; the box-vs-class decomposition is what makes the comparison meaningful.
-
-## 6. Latency and throughput
-
-Per-frame inference, VisDrone val:
-
-| Platform | Backend | infer (ms) | FPS |
-|---|---|---|---|
-| Windows 11 CPU | ONNX (ORT) | 37.6 | **25.4** |
-| Windows 11 CPU | NCNN | 80.1 | 12.2 |
-| Linux CPU (4-thread) | ONNX (ORT) | 40.0 | 25.0 |
-| Linux CPU (4-thread) | **MNN** | 74.0 | 13.5 |
-| Linux CPU (4-thread) | NCNN | ~80 | ~12.5 |
-| Linux CPU (4-thread) | ONNX INT8 (mixed) | 137 | 7.2 |
-| Linux H200 | **ONNX CUDA (C++)** | 7.8 | **~128** |
-| Jetson Orin Nano 4GB | **TensorRT FP16** | 27.8 | **35.7** |
-
-The ordering is consistent and explicable: **ORT is ~2× faster than MNN and NCNN on x86** because it is heavily x86/AVX-tuned, while MNN and NCNN are mobile/ARM-first runtimes — which is exactly why both are carried forward for the Orin, where that ranking is expected to invert. CUDA delivers a ~5× step over CPU. **INT8 is the slowest CPU row (2.8× slower than FP32 ONNX), for the reasons in §3.6** — a reminder that INT8 is a *hardware*-dependent optimization, not a free win. On x86 CPU no format beats ORT, so the "best export format" is platform-dependent, not absolute — the reason we ship three.
-
-## 7. Cross-platform builds and distribution
-
-A single cross-platform **CMake** builds and runs on two platforms today: **Linux x86_64** (with the ONNXRuntime CUDA EP; C++ CUDA mAP50-95 = 0.2033, −0.03% vs PyTorch, at 7.8 ms/frame / ~128 FPS) and **Windows 11 x64** (VS 2026 / MSVC 19.5x). The Windows port surfaced three concrete portability issues, each fixed in the build system rather than worked around: `Ort::Session` takes `const wchar_t*` on Windows (a platform `ORTCHAR_T` shim); the prebuilt OpenCV config doesn't recognize the VS 2026 toolset and reports an empty runtime (point `OpenCV_DIR` at the concrete `vc16/lib` config); and the exe needs the MSVC runtime on clean targets (bundled via `InstallRequiredSystemLibraries`). Both platforms ship as **self-contained, relocatable bundles** — Linux 35 MB (`$ORIGIN`, 10 libs, verified isolated), Windows with its runtime bundled — installable by unzip.
-
-## 8. Embedded GPU deployment: Jetson Orin
-
-The runtime was taken to a **Jetson Orin Nano 4 GB** (JetPack 7: Ubuntu 24.04, CUDA 13.2, TensorRT 10.16.2, sm87). The same CMake produces a native aarch64 binary with a third backend — a `trt_backend` that deserializes a prebuilt engine and runs it via `enqueueV3`, joining the ONNXRuntime and NCNN backends behind the same interface. The engine is built on-device with `trtexec` from the exported ONNX.
-
-**Result.** The FP16 engine runs at **27.8 ms/frame GPU compute (35.7 FPS)**, and on-device accuracy over the full 548 VisDrone val images is **mAP50 0.3488 / mAP50-95 0.2029 — −0.46% / −0.34% vs the PyTorch FP32 baseline** (0.3504 / 0.2036), matching the x86 ONNX result to within 0.2 mAP points. On-device mAP is scored with a dependency-free reimplementation of the same metric harness (`scripts/eval_map_standalone.py`).
-
-**FP16, not INT8.** §3.6 reserved the INT8 *throughput* proof for this path, on the expectation that tensor-core INT8 would invert the CPU result. For this model it does not. The mixed-precision assignment from §3 keeps the attention, head, and router in higher precision, so INT8 leaves the compute-heavy area-attention on FP32/FP16 kernels; combined with TensorRT's INT8 being lossier than the ONNXRuntime path, the calibrated INT8 engine measures **0.3202 mAP50 at 21.7 FPS — slower *and* less accurate than FP16**. Where a network's dominant cost is attention that does not quantize, **FP16 is the correct embedded target**; INT8's tensor-core advantage applies to convolution-dominated models, not this one. This refines the expectation stated in §3.6.
-
-**Build notes.** Two toolchain specifics are worth recording. On sm87 with TensorRT 10.16.2 a pure-FP16 build fails at low builder-optimization levels (the timing model references an sm80 shader that has no sm87 base); `--builderOptimizationLevel=3` selects tactics by on-device profiling instead and builds cleanly. And an ONNXRuntime-quantized QDQ model must use symmetric activations and non-quantized bias to be accepted by TensorRT's parser (`quantize_int8.py --symmetric`). The 4 GB module also needs swap for the engine *build* (inference itself uses ~20 MB). Full reproduction is in [`jetson/DEPLOYMENT_LOG.md`](jetson/DEPLOYMENT_LOG.md).
-
-**Distribution.** A prebuilt aarch64 bundle (`jetson/30_package.sh`) ships the binary with OpenCV bundled and TensorRT/CUDA taken from JetPack; it runs on any Orin (Nano/NX/AGX) on JetPack 7, with the per-device engine built once by an included script.
-
-## 9. Future work
-
-- **Production drone platform — DJI Manifold 3.** VisDrone is aerial/drone imagery, so the natural production target is an onboard drone computer. [DJI Manifold 3](https://enterprise.dji.com/manifold-3) is an **NVIDIA Orin NX-based** enterprise edge computer purpose-built for drones — the exact aarch64 + TensorRT path above deploys onto it directly. Validating this pipeline on the Manifold 3 exercises **real-time on-drone inference in operational conditions** (aerial surveillance, infrastructure inspection, search-and-rescue), closing the loop from VisDrone training to production drone edge deployment.
-
----
-
-*Reproducibility:* the C++ runtime, all scripts (`quantize_int8.py`, `eval_map.py`, `eval_map_standalone.py`, `mnn_val.py`, `mnn_parity.py`, `package_linux.sh`), and the Jetson kit (`jetson/`, incl. `DEPLOYMENT_LOG.md`) are in the repository above; the exported models and prebuilt bundles (Linux, Windows, Jetson Orin) are attached to the [Releases](https://github.com/skywalker-lt/yolo-master-edge/releases) page.
+# Technical Note: Auditable Edge Deployment for Issue #51
+
+## Abstract
+
+This note describes the implementation and the measurement protocol supplied
+for Issue #51, which concerns edge inference of vertically trained YOLO-Master
+models. The contribution is a backend-independent C++ runtime together with
+export, validation, quantization and evidence tooling. The design treats
+reproducibility as part of the deployment interface: a metric is considered a
+result only when the model, ordered image set, command line, software
+environment and raw predictions can be verified from a content-addressed
+manifest.
+
+The source tree contains no EsMoE-N checkpoint, VisDrone images or generated
+prediction directory. This document therefore specifies an executable method
+and the implementation boundaries; it does not claim a new mAP, FPS or ARM64
+measurement.
+
+## Contribution and verification status
+
+The table below is the short reviewer-facing record. It separates implementation
+evidence from measurements that require a user-supplied checkpoint and data.
+
+| Contribution | Reproducible artifact | Status in this checkout |
+| --- | --- | --- |
+| Unified C++17 inference path | ONNX Runtime, NCNN and MNN adapters with shared preprocessing, decoding and NMS | L0 contract-checked |
+| Export and conversion checks | ONNX checker/simplifier, NCNN pair/sidecar validation, MNN conversion diagnostics | L0 structural checks |
+| Accuracy and parity protocol | Ordered image manifest, mAP evaluator, percentage-point gate and per-image prediction diff | L0 tooling |
+| INT8 protocol | Training-only calibration selection (>=300 images), hash disjointness and protected nodes | L0 tooling |
+| Linux functional smoke | Ubuntu 22.04 x86_64, YOLOv5s ONNX, one image and six detections | L1 smoke evidence |
+| EsMoE-N acceptance result | VisDrone/SKU-110K full split, mAP, INT8 and a second native platform | Pending checkpoint/data/logs |
+
+The smoke run is a functional check of the runtime and is not an EsMoE-N
+accuracy claim. No result is promoted to an acceptance claim until its model,
+image set, predictions and raw logs are available for independent verification.
+
+## 1. Evaluation objective
+
+The target comparison is a single trained checkpoint evaluated through
+PyTorch and at least two deployment formats (ONNX Runtime plus NCNN or MNN).
+Every path must consume the same ordered validation images and the same
+post-processing parameters. The minimum acceptance record is:
+
+* a fixed validation list with at least 500 images (the common VisDrone split
+  contains 548 images);
+* a PyTorch/reference metric JSON and per-image predictions for each backend;
+* a model and image-list SHA256 digest;
+* an explicit EsMoE routing-semantic record shared by the reference and export;
+* a latency log with fixed thread count, warm-up, repeat count and host details.
+
+Optional INT8 evaluation adds a training-only calibration list of at least 300
+images. The calibration and validation sets are checked for content overlap,
+not merely for different filenames.
+
+These requirements make the evaluation record independent of a particular
+machine, exporter ordering or directory traversal. The same protocol is used
+for every backend and platform so that a reported difference has a traceable
+cause.
+
+### 1.1 Training provenance and image-manifest control
+
+The checkpoint is treated as an experimental input rather than as an
+interchangeable model file. A submission record should therefore include the
+base-model or repository revision, dataset release and split, class mapping,
+epoch count, optimizer and learning-rate schedule, random seed,
+deterministic-setting, training software versions and the SHA256 of the best
+checkpoint. The exact training command and the selected checkpoint should be
+archived alongside the exported graphs.
+
+The validation population is materialized before inference. For the standard
+VisDrone validation split this is an ordered list of 548 image paths; the list
+is reused unchanged by PyTorch, ONNX Runtime, NCNN and MNN. The manifest stores
+one record per image (relative path, byte count and SHA256), rejects duplicate
+stems and computes an ordered-list digest. A run with fewer than 500 images is
+diagnostic only. This distinction prevents a convenient subset or a stale
+prediction directory from being presented as a full-split result.
+
+Metric JSON records both the path-only `image_manifest_sha256` and the
+content-aware `image_list_sha256`. The latter hashes ordered
+`relative-path SHA256` rows and therefore matches the evidence manifest. The
+reference gate compares both fields, so replacing an image while retaining its
+filename invalidates the comparison. For a list stored outside the dataset
+tree, `--image-root` defines the normalization boundary; entries outside that
+boundary are rejected.
+
+The same control applies to INT8 calibration. Calibration images are selected
+from the training split, deterministically ordered and content-hash compared
+with the validation records. At least 300 images are required, and any hash
+overlap invalidates the calibration evidence even when filenames differ.
+
+## 2. Runtime architecture
+
+The C++ runner is organized into four layers:
+
+1. **Input and timing.** `main.cpp` resolves image, directory, video, dataset
+   YAML and newline-delimited image-list sources. Dataset `val` accepts a
+   scalar or YAML sequence; list inputs preserve their declared order, while
+   directory inputs are sorted deterministically. The runner records failures
+   and emits per-image timing rows.
+2. **Preprocessing.** `common.cpp` implements centered letterbox (padding
+   value 114), BGR-to-RGB conversion and NCHW `float32 / 255` packing. Stretch
+   mode is available only as an explicit diagnostic override.
+3. **Backend adapters.** `ort_backend.cpp`, `ncnn_backend.cpp` and
+   `mnn_backend.cpp` load a graph once and expose the same `Backend` interface.
+   Optional native TensorRT support is compiled only with a TensorRT 10.x SDK;
+   older TensorRT releases should use the ONNX Runtime TensorRT execution
+   provider path.
+4. **Shared decoding.** Raw tensors are normalized to the feature-major
+   `[features, anchors]` layout, decoded to original-image pixel coordinates,
+   filtered with class-aware NMS and capped at `max_det`. Segmentation
+   prototypes are carried separately so annotation export does not alter box
+   results.
+
+The backend factory infers a format from the model path, accepts case-insensitive
+suffixes, and reports an error for an ambiguous NCNN directory. Metadata is
+used for names and input size when available; explicit profiles take precedence
+for domain-critical class mappings.
+
+## 3. Canonical post-processing profiles
+
+The profile is part of the run contract and is printed in the console header.
+The VisDrone profile is:
+
+| Parameter | Value |
+| --- | ---: |
+| Input | 640 x 640 |
+| Confidence threshold | 0.001 |
+| NMS IoU threshold | 0.70 |
+| Maximum detections | 300 |
+| Small-object confidence floor | disabled (`--small-conf=-1`); area threshold 1024 px^2 |
+| Class policy | ten canonical VisDrone classes |
+| Decode | multi-label per anchor |
+| Resize | centered letterbox, pad 114 |
+
+The SKU-110K profile uses a 1280-square input, confidence 0.25, IoU 0.60 and
+the one-class mapping. Callers may override thresholds for deployment, but the
+resulting values are recorded and must not be compared with a run using a
+different protocol.
+
+The runner also exposes an optional area-adaptive confidence floor for dense
+small-object scenes. When `--small-conf` is non-negative, candidates whose
+decoded area in the original image is below `--small-area` use
+`min(conf, small-conf)` before class-aware NMS. This setting is intentionally
+disabled in the canonical profile; enable it only for a separately identified
+NMS sweep and record both values in the manifest. The implementation matches
+the thresholding rule in `scripts/mnn_val.py`.
+
+The evidence manifest and metric JSON carry both numeric values, including the
+disabled sentinel (`small_conf=-1`). A reference/candidate delta gate rejects
+reports that omit or change either field.
+
+### 3.1 EsMoE routing semantics
+
+EsMoE has two materially different inference paths. Eager PyTorch inference
+may dispatch only the top-k experts (`native_sparse`), whereas static export
+must evaluate and blend all experts when the exporter cannot lower the
+data-dependent dispatch (`dense_fallback`). These paths are not interchangeable
+baselines: a backend comparison is valid only when the reference and exported
+run declare the same `protocol.routing_semantics`. The export summary records
+the selected path and the number of layers whose routing flags were changed;
+the evidence manifest and both metric evaluators preserve that field for the
+strict delta gate. Models without an MoE block use `not_applicable`.
+
+### 3.2 Class-count safety
+
+Class metadata is a frequent source of silent parity failures. For an explicit
+vertical profile, the runner selects the canonical mapping even when
+`--classes auto` is supplied. If the loaded model also exposes names and its
+class count disagrees with that profile, startup fails with the expected and
+observed counts. A generic/default run continues to use model metadata and
+requires the evaluator's `--classes` choice to match the checkpoint.
+
+### 3.3 Tensor-shape safety
+
+ONNX outputs are accepted only when a floating-point rank-3 tensor has batch
+one, a plausible feature dimension (`4 + nc` or larger) and a positive anchor
+dimension. Both `[1, features, anchors]` and `[1, anchors, features]` are
+normalized. When several rank-3 tensors remain equally plausible after the
+feature/anchor checks, the ONNX and MNN adapters fail explicitly instead of
+depending on exporter ordering. Rank-4 outputs are treated as segmentation
+prototypes only after their dimensions are validated. MNN and NCNN apply the
+same rank, dimension, finite-value and layout checks before entering the shared
+decoder; MNN status-returning API calls are checked and an unavailable
+accelerator is retried with a CPU session. This turns a wrong export into an
+explicit diagnostic instead of a plausible-looking empty prediction file.
+The MNN adapter requires float32 public input/output tensors; quantized graphs
+remain eligible when quantization is internal and the graph boundary stays
+float32.
+
+## 4. Export and conversion
+
+`scripts/export_models.py` is a wrapper around the model's native exporter. It
+uses a static square input, runs ONNX checker/simplification by default and
+writes an export summary containing the checkpoint digest, requested formats,
+graph checks and NCNN pair status. `--no-simplify` is retained for diagnosis
+only and requires `--allow-unsimplified`.
+
+NCNN conversion may emit names other than `in0` and `out0`. The exporter writes
+the actual input/output/prototype names to both `<param-stem>.metadata.yaml` and
+the shared `metadata.yaml` (the latter retains legacy compatibility). The runtime validates
+each declared name against the parsed `.param` graph before inference. When no
+sidecar is present it resolves a unique graph endpoint, retains the historical
+`in0`/`out0`/`out1` fallback, and fails closed when multiple terminal tensors make
+the roles ambiguous. A prototype explicitly declared by metadata is mandatory;
+missing it is an error rather than a silent box-only result. For a directory input,
+exactly one matching `.param`/`.bin` pair is required unless the conventional
+`model.ncnn.*` pair is present.
+
+MNN conversion is intentionally not treated as acceptance evidence. The
+converter output must load in the MNN runtime, produce a finite detection
+tensor, and pass the same per-image metric gate before it is listed as a
+validated backend.
+
+## 5. Accuracy evaluation
+
+There are two evaluators because a deployment host may not have the full
+training environment:
+
+* `eval_map.py` delegates AP matching to Ultralytics and is the preferred
+  formal path when PyTorch is available;
+* `eval_map_standalone.py` implements the same ten IoU thresholds with only
+  NumPy and standard-library dependencies.
+
+Both parsers are strict about column count, finite values, class range and
+positive geometry. The formal path requires one prediction and one label file
+for every image outside `--smoke`, rejects duplicate stems and records the
+ordered image-list digest. Native VisDrone rows are accepted for diagnosis;
+formal runs should use the official `visdrone2yolo` conversion so ignored
+regions have defined semantics.
+
+The result JSON exposes two distinct units:
+
+```text
+delta_mAP50-95_pp  = (candidate - reference) * 100
+delta_mAP50-95_pct = (candidate - reference) / reference * 100
+```
+
+Use `--max-abs-delta-pp` for an absolute percentage-point budget. The
+relative `--max-abs-delta-pct` option is retained for compatibility and cannot
+be combined with the absolute gate. The relative gate requires a positive
+reference metric; either gate requires the same image-list/protocol metadata.
+
+When a gate fails, `scripts/prediction_diff.py` matches same-class boxes by IoU
+and reports missing boxes, confidence differences and coordinate differences
+per image. It accepts the same BOM-tolerant, quoted ordered image list as the
+metric evaluators and can enforce an explicit `--image-root`; this prevents a
+diagnostic report from silently analyzing a different file set. The report
+separates preprocessing/decode errors from genuine model quality changes
+without rerunning inference.
+
+## 6. INT8 calibration
+
+The quantization helper is deliberately conservative. It:
+
+1. selects a deterministic, sorted calibration list;
+2. requires at least 300 images;
+3. applies the same letterbox/RGB/NCHW preprocessing contract;
+4. compares calibration image content hashes with the validation list;
+5. records the selected list digest, quantizer settings and exclusion patterns.
+
+The default exclusion patterns protect detection-head, attention and routing
+nodes when they exist. A pattern matching no graph node is an error, preventing
+a command-line typo from silently changing the precision recipe. The generated
+summary is always marked `acceptance_ready: false`; only a subsequent full
+prediction/evaluation run can establish an INT8 result.
+
+## 7. Benchmark methodology
+
+Latency comparisons are meaningful only when the following are held constant:
+
+* ordered image list and image decoding path;
+* input size, precision, confidence/IoU policy and maximum detections;
+* CPU/GPU device, runtime build and thread count;
+* warm-up count and timed repeat count.
+
+The runner reports preprocessing, inference, postprocessing and end-to-end
+times per image, followed by mean, P50, P95, P99 and FPS. With
+`--benchmark-json`, an optional sidecar records the resolved protocol, host
+platform, compiler, CPU model, logical CPU count and build date; `--csv` retains
+the per-image timing rows. The evidence manifest additionally records exact file
+hashes. Virtual-machine
+measurements are valid diagnostics but must be labelled as VM results and must
+not be generalized to ARM or Jetson hardware.
+
+Capture a separate host/toolchain snapshot before the run:
+
+```bash
+python3 scripts/collect_environment.py \
+  --repo-root . --backend onnx --execution-provider cpu \
+  --threads 4 --warmup 2 --runs 20 \
+  --output artifacts/environment.json
+```
+
+The collector is dependency-free and reports missing optional tools explicitly.
+Its output follows [`environment.schema.json`](environment.schema.json) and can
+be attached as `--report environment=artifacts/environment.json` when creating
+the evidence manifest.
+
+For publication, report the results in a table whose values point to the
+corresponding manifest and raw logs. The table is intentionally a schema, not
+a set of default numbers:
+
+| Backend | Export/checkpoint digest | Image count/list digest | mAP50-95 | Delta (pp) | End-to-end P50/P95/P99 | FPS | Host and runtime |
+| --- | --- | --- | ---: | ---: | --- | ---: | --- |
+| PyTorch reference | recorded in manifest | recorded in manifest | from metric JSON | -- | from timing log | from timing log | recorded in manifest |
+| ONNX Runtime | recorded in manifest | recorded in manifest | from metric JSON | from metric JSON | from timing log | from timing log | recorded in manifest |
+| NCNN or MNN | recorded in manifest | recorded in manifest | from metric JSON | from metric JSON | from timing log | from timing log | recorded in manifest |
+
+No cell is a result until the reviewer can recompute it from the stated model
+digest, image-list digest and per-image predictions. Compute latency and
+end-to-end latency are reported separately; a virtual-machine value is labelled
+as such.
+
+## 8. Evidence manifest
+
+`evidence_manifest.py` and `evidence-manifest.schema.json` define the release
+boundary. An acceptance manifest contains:
+
+* dataset name/split, ordered image records and a list digest;
+* required training provenance, including base-model revision, dataset
+  version, epoch/seed configuration and the exact training command;
+* the complete protocol and class profile;
+* checkpoint and every exported model, each with file hashes;
+* labels and predictions with matching counts;
+* calibration records and an explicit disjointness assertion for INT8;
+* environment, source revision, command line, content-hashed metric/benchmark
+  reports and gate values.
+
+`validate` checks the structure; `verify` additionally recomputes hashes under
+the supplied roots. The template intentionally leaves labels and predictions
+null and cannot pass the acceptance validator. This prevents a release note or
+an empty directory from being mistaken for a completed experiment.
+
+## 9. Build and portability controls
+
+The CMake target enables each backend only when its headers and library are
+found. `REQUIRE_ORT`, `REQUIRE_NCNN` and `REQUIRE_MNN` turn missing SDKs into
+configuration errors; `ALLOW_NO_BACKENDS` is reserved for dependency-light
+CLI diagnostics. On Windows, model and image paths are converted from UTF-8 to
+UTF-16 before opening; the JPEG writer uses the same wide-path handling. On
+Linux, the release script computes the recursive shared-library closure and
+sets an `$ORIGIN/lib` RPATH while leaving system glibc and accelerator drivers
+to the target host.
+
+The ARM64 toolchain file describes cross-compilation but does not claim that a
+cross-compiled binary has run on hardware. A native Jetson run must archive the
+binary, engine, device/software versions and raw log together with the same
+manifest.
+
+## 10. Reproducibility status of this checkout
+
+The repository-level contract tests cover profile resolution, parser failures,
+shape normalization, evidence-manifest gates and prediction diagnostics. A
+previous Ubuntu 22.04 smoke run loaded a YOLOv5s ONNX model on one image; that
+is a functional L1 check, not an EsMoE-N VisDrone accuracy result. The full
+Issue #51 acceptance record remains intentionally pending until a real
+EsMoE-N checkpoint, dataset split and target-platform logs are supplied.
+
+This boundary is important: a reproducible procedure is useful only when its
+limitations are stated as precisely as its successes.
+
+## 11. Publication record
+
+The public submission should contain a compact result table followed by links to
+the machine-readable evidence. Use one row per backend and keep the protocol
+identical across rows:
+
+| Backend | Model/checkpoint SHA256 | Image-list SHA256 | Images | mAP50-95 | Delta (pp) | P50/P95/P99 (ms) | FPS | Platform |
+| --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- |
+| PyTorch reference | evidence manifest | evidence manifest | N | metric JSON | -- | timing CSV | timing CSV | environment JSON |
+| ONNX Runtime | evidence manifest | evidence manifest | N | metric JSON | metric JSON | timing CSV | timing CSV | environment JSON |
+| NCNN or MNN | evidence manifest | evidence manifest | N | metric JSON | metric JSON | timing CSV | timing CSV | environment JSON |
+
+The accompanying text should state the dataset release and split, checkpoint
+provenance, preprocessing and NMS parameters, runtime versions, thread policy,
+warm-up/repeat counts, and the exact commands used. A platform is listed as
+validated only when both compilation and an inference run were executed on that
+platform. Cross-compilation, CI compilation, or a virtual-machine smoke test
+must be labelled accordingly and must not be presented as native device
+evidence.
+
+For a short discussion post, use `TECHNICAL_SUMMARY_ZH.md` as the narrative and
+attach the evidence manifest, metric JSON, timing CSV/JSON, prediction archive,
+environment snapshot and model/export summaries. Keep all unavailable fields
+explicitly marked as pending until the corresponding files can be verified.

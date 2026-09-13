@@ -1,5 +1,8 @@
 // Windows platform layer: Win32 window + D3D11 device/swapchain + Dear ImGui bootstrap.
 // Injects texture-upload + file-dialog services into the portable App (app.cpp).
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
@@ -104,6 +107,22 @@ static std::string OpenFileDialog(const char* title, const char* filter) {
     ofn.lpstrTitle = title;
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
     return GetOpenFileNameA(&ofn) ? std::string(fn) : std::string();
+}
+
+static std::string SaveFileDialog(const char* title, const char* filter,
+                                  const char* def_name, const char* def_ext) {
+    char fn[1024] = "";
+    if (def_name) lstrcpynA(fn, def_name, sizeof(fn));
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFile = fn;
+    ofn.nMaxFile = sizeof(fn);
+    ofn.lpstrFilter = filter;
+    ofn.lpstrTitle = title;
+    ofn.lpstrDefExt = def_ext;                     // appended when the user types no extension
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+    return GetSaveFileNameA(&ofn) ? std::string(fn) : std::string();
 }
 
 static void ReleaseTexture(gui::Texture& tex) {
@@ -252,6 +271,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     gui::Platform plat;
     plat.upload      = UploadTexture;
     plat.open_file   = OpenFileDialog;
+    plat.save_file   = SaveFileDialog;
     plat.open_folder = OpenFolderDialog;
     plat.release     = ReleaseTexture;
     plat.heading_font = headingFont;

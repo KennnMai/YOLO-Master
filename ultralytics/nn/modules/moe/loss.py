@@ -1,10 +1,11 @@
 # 🐧Please note that this file has been modified by Tencent on 2026/02/13. All Tencent Modifications are Copyright (C) 2026 Tencent.
 """Auxiliary losses for Mixture-of-Experts models (Production Grade)"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from typing import Optional, Dict, Union
+from typing import Optional, Dict, Tuple, Union
 from ultralytics.nn.modules._numeric import all_reduce_mean, clamp_min_for_dtype, should_reduce_ddp
 from .scheduler import MoEDynamicScheduler, MoEDynamicSchedulerConfig
 
@@ -12,8 +13,7 @@ from .scheduler import MoEDynamicScheduler, MoEDynamicSchedulerConfig
 _dtype_clamp_min = clamp_min_for_dtype
 
 
-def gshard_balance_loss(expert_usage: torch.Tensor, num_experts: int,
-                        reduce_ddp: bool = False) -> torch.Tensor:
+def gshard_balance_loss(expert_usage: torch.Tensor, num_experts: int, reduce_ddp: bool = False) -> torch.Tensor:
     """GShard-style balance loss: N * sum(usage^2). Equals 1.0 at uniform usage.
 
     When ``reduce_ddp`` is True the (normalised) usage is averaged across DDP
@@ -72,8 +72,11 @@ def differentiable_balance_loss(
     `router_probs` is normalized to ``[N, num_experts]`` mean before use, so it
     accepts both ``[B, E]`` and ``[B, E, 1, 1]`` (mean-reduced) inputs.
     """
-    probs = router_probs.reshape(router_probs.shape[0], router_probs.shape[1], -1).mean(-1) \
-        if router_probs.dim() == 4 else router_probs.reshape(-1, num_experts)
+    probs = (
+        router_probs.reshape(router_probs.shape[0], router_probs.shape[1], -1).mean(-1)
+        if router_probs.dim() == 4
+        else router_probs.reshape(-1, num_experts)
+    )
     importance = probs.mean(dim=0)  # keeps grad
     importance = importance / _dtype_clamp_min(importance.sum())
 
@@ -107,7 +110,7 @@ class MoELoss(nn.Module):
         z_loss_coeff: float = 1.0,
         entropy_loss_coeff: float = 0.0,
         diversity_loss_coeff: float = 0.0,  # New: penalize similar expert outputs
-        variance_loss_coeff: float = 0.0,   # New: direct variance penalty on usage
+        variance_loss_coeff: float = 0.0,  # New: direct variance penalty on usage
         num_experts: int = 8,
         top_k: int = 2,
         use_soft_balancing: bool = False,
@@ -199,13 +202,66 @@ class MoELoss(nn.Module):
         global_mean = local_sum / local_count.clamp(min=1.0)
         return (local_mean + (global_mean - local_mean.detach())).to(orig_dtype)
 
+    def _get_global_statistics(
+        self, router_probs: torch.Tensor, expert_indices: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reduce router importance and hard usage in one packed collective.
+
+        The legacy helpers reduce the same MoE layer statistics in four
+        separate calls (importance sum/count and expert counts/total). Packing
+        them keeps the global values and local autograd path unchanged while
+        reducing launch/synchronization overhead in DDP.
+        """
+        if expert_indices is not None:
+            flat_indices = expert_indices.reshape(-1).to(torch.long)
+            local_counts = F.one_hot(flat_indices, num_classes=self.num_experts).float().sum(dim=0)
+            local_selected = local_counts.new_tensor(float(flat_indices.numel()))
+        else:
+            flat_indices = None
+            local_counts = None
+            local_selected = None
+
+        if not should_reduce_ddp(self):
+            importance = router_probs.mean(dim=0)
+            usage = local_counts / local_selected.clamp_min(1.0) if local_counts is not None else importance.detach()
+            return importance, usage.detach()
+
+        original_dtype = router_probs.dtype
+        local_probs = router_probs.float()
+        local_mean = local_probs.mean(dim=0)
+        local_sum = local_probs.sum(dim=0).detach()
+        local_count = local_sum.new_tensor(float(router_probs.shape[0]))
+        parts = [local_sum, local_count.reshape(1)]
+        if local_counts is not None:
+            parts.extend((local_counts.detach(), local_selected.reshape(1)))
+        packed = torch.cat(parts)
+
+        # NCCL only accepts CUDA tensors; normal DDP CUDA paths already arrive
+        # here on CUDA, while the explicit branch keeps the helper safe for
+        # callers that construct CPU statistics under a NCCL process group.
+        if packed.device.type == "cpu" and dist.get_backend() == "nccl":
+            packed = packed.cuda()
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+
+        offset = self.num_experts
+        global_mean = packed[:offset] / packed[offset].clamp_min(1.0)
+        importance = (local_mean + (global_mean.to(local_mean.device) - local_mean.detach())).to(original_dtype)
+        if local_counts is None:
+            return importance, importance.detach()
+
+        counts_start = offset + 1
+        global_counts = packed[counts_start : counts_start + self.num_experts]
+        global_selected = packed[counts_start + self.num_experts].clamp_min(1.0)
+        usage = (global_counts / global_selected).to(local_counts.device).detach()
+        return importance, usage
+
     def forward(
         self,
         router_probs: torch.Tensor,
         router_logits: torch.Tensor,
         expert_indices: Optional[torch.Tensor] = None,
         expert_outputs: Optional[torch.Tensor] = None,
-        return_dict: bool = False
+        return_dict: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args:
@@ -221,23 +277,9 @@ class MoELoss(nn.Module):
             expert_indices = self._flatten_expert_indices(expert_indices)
 
         # 1. Load Balancing Loss
-        importance = self._get_global_mean(router_probs)
-
-        if self.use_soft_balancing:
-            # === Soft Balancing (Differentiable, GShard / Switch style) ===
-            # Prefer discrete Top-K counts when available; this matches the
-            # Switch/GShard signal used by hard balancing while keeping gradient
-            # flow through `importance`. If a legacy caller has no indices, fall
-            # back to detached importance rather than failing the training step.
-            usage = self._usage_from_expert_indices(expert_indices) if expert_indices is not None else importance.detach()
-        else:
-            # === Hard Balancing (GShard / Switch Style) ===
-            # Usage is defined by the discrete selection count.
-            # Requires expert_indices.
-            if expert_indices is None:
-                raise ValueError("expert_indices is required for hard load balancing.")
-
-            usage = self._usage_from_expert_indices(expert_indices)
+        if not self.use_soft_balancing and expert_indices is None:
+            raise ValueError("expert_indices is required for hard load balancing.")
+        importance, usage = self._get_global_statistics(router_probs, expert_indices)
 
         # Balance Loss: N * sum(importance * usage)
         balance_loss = self.num_experts * torch.sum(importance * usage)
@@ -246,7 +288,7 @@ class MoELoss(nn.Module):
         # ------------------------------------------------------------------
         # log(sum(exp(x)))^2
         log_z = torch.logsumexp(router_logits, dim=1)
-        z_loss = torch.mean(log_z ** 2)
+        z_loss = torch.mean(log_z**2)
 
         # 3. Entropy Loss (Certainty Regularization) - Optional
         entropy_loss = torch.tensor(0.0, device=router_probs.device)
@@ -276,7 +318,7 @@ class MoELoss(nn.Module):
                 masked_sim = similarity * mask.unsqueeze(0)  # [B, E, E]
                 # Target: similarity -> 0 (orthogonal), penalize deviation from 0
                 num_pairs = E * (E - 1)
-                diversity_loss = (masked_sim ** 2).sum() / (B * num_pairs + 1e-8)
+                diversity_loss = (masked_sim**2).sum() / (B * num_pairs + 1e-8)
 
         # 5. Variance Loss (Direct usage variance penalty) - Optional
         # Penalizes high variance in expert usage, encouraging uniform distribution
@@ -298,7 +340,7 @@ class MoELoss(nn.Module):
 
         # Apply MapSaturationScheduler (mAP-driven annealing) on top of dynamic scheduler
         map_sat_state = None
-        if getattr(self, 'map_saturation_scheduler', None) is not None:
+        if getattr(self, "map_saturation_scheduler", None) is not None:
             map_sat_state = self.map_saturation_scheduler.last_state
             bl_coeff = self.map_saturation_scheduler.apply(bl_coeff)
 
@@ -316,11 +358,13 @@ class MoELoss(nn.Module):
                 self._coeff_floor_warned = True
 
         # 6. Total Loss
-        total_loss = (bl_coeff * balance_loss) + \
-                     (zl_coeff * z_loss) + \
-                     (self.entropy_loss_coeff * entropy_loss) + \
-                     (self.diversity_loss_coeff * diversity_loss) + \
-                     (self.variance_loss_coeff * variance_loss)
+        total_loss = (
+            (bl_coeff * balance_loss)
+            + (zl_coeff * z_loss)
+            + (self.entropy_loss_coeff * entropy_loss)
+            + (self.diversity_loss_coeff * diversity_loss)
+            + (self.variance_loss_coeff * variance_loss)
+        )
 
         # NaN Guard (Graph Safe) — count hits for periodic diagnostics.
         if not torch.isfinite(total_loss).all():

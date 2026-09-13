@@ -1,29 +1,56 @@
-"""torchrun smoke for CPU/gloo or CUDA/NCCL sparse-branch DDP."""
-import argparse, os
+"""Two-rank CPU/Gloo continuous-training gate for a real routed module."""
+
+import os
 from datetime import timedelta
+
 import torch
 import torch.distributed as dist
-from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-class Sparse(nn.Module):
- def __init__(self):
-  super().__init__(); self.shared=nn.Linear(4,4); self.experts=nn.ModuleList([nn.Linear(4,4),nn.Linear(4,4)])
-  self.register_buffer("cpu_diagnostic", torch.tensor(0.), persistent=False)
- def forward(self,x,rank): return self.experts[rank%2](self.shared(x)).sum()
+
+from ultralytics.nn.modules.moe.modules import OptimizedMOE
+from ultralytics.utils import WINDOWS
+from ultralytics.utils.torchrun import disable_libuv_rendezvous
+
+
 def main():
- ap=argparse.ArgumentParser(); ap.add_argument('--backend',choices=['gloo','nccl'],default='gloo'); a=ap.parse_args()
- rank=int(os.environ['RANK']); local=int(os.environ['LOCAL_RANK']); world=int(os.environ['WORLD_SIZE'])
- if a.backend=='nccl':
-  if not torch.cuda.is_available() or local>=torch.cuda.device_count(): raise RuntimeError('invalid CUDA local rank')
-  torch.cuda.set_device(local); device=torch.device('cuda',local)
- else: device=torch.device('cpu')
- dist.init_process_group(a.backend,timeout=timedelta(seconds=60))
- try:
-  model=Sparse().to(device); model.cpu_diagnostic=torch.tensor(float(rank))
-  ddp=DDP(model,device_ids=[local] if device.type=='cuda' else None,output_device=local if device.type=='cuda' else None,find_unused_parameters=True,broadcast_buffers=False,static_graph=False)
-  opt=torch.optim.SGD(ddp.parameters(),lr=.1); opt.zero_grad(); ddp(torch.ones(2,4,device=device),rank).backward(); opt.step()
-  flat=torch.cat([p.detach().reshape(-1) for p in ddp.module.parameters()]); gathered=[torch.empty_like(flat) for _ in range(world)]; dist.all_gather(gathered,flat)
-  assert all(torch.allclose(gathered[0],v) for v in gathered[1:]); assert ddp.module.cpu_diagnostic.device.type=='cpu'
-  if rank==0: print(f'DDP sparse smoke passed: backend={a.backend}, world_size={world}')
- finally: dist.destroy_process_group()
-if __name__=='__main__': main()
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    assert world == 2, f"P0 gate requires exactly two ranks, got {world}"
+    torch.set_num_threads(1)
+    if WINDOWS:
+        disable_libuv_rendezvous()
+    dist.init_process_group("gloo", timeout=timedelta(seconds=60))
+    try:
+        torch.manual_seed(1234)
+        model = OptimizedMOE(8, 8, num_experts=2, top_k=2)
+        ddp = DDP(model, find_unused_parameters=True, broadcast_buffers=False)
+        optimizer = torch.optim.SGD(ddp.parameters(), lr=0.05)
+        # A constant image is a degenerate normalization case: BatchNorm and
+        # the experts' GroupNorm can legitimately remove the entire signal.
+        # Keep the fixture deterministic, but include spatial/channel variation
+        # so this gate measures real routed gradients on every backend.
+        pattern = torch.linspace(-1.0, 1.0, steps=4 * 8 * 2 * 2, dtype=torch.float32).reshape(4, 8, 2, 2)
+        pattern = (pattern - pattern.mean()) / pattern.std()
+        for step in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            inputs = pattern + 0.25 * rank + 0.1 * step
+            loss = ddp(inputs).square().mean()
+            loss.backward()
+            routed_params = [p for p in ddp.module.experts.parameters() if p.requires_grad]
+            routed_grads = [p.grad for p in routed_params if p.grad is not None]
+            assert len(routed_grads) == len(routed_params), "routed experts produced incomplete gradients"
+            assert all(torch.isfinite(grad).all() for grad in routed_grads), "non-finite routed gradient"
+            assert sum(float(grad.abs().sum()) for grad in routed_grads) > 0.0, "all routed gradients are zero"
+            optimizer.step()
+            flat = torch.cat([p.detach().reshape(-1) for p in ddp.module.parameters()])
+            gathered = [torch.empty_like(flat) for _ in range(world)]
+            dist.all_gather(gathered, flat)
+            assert torch.allclose(gathered[0], gathered[1]), f"parameters diverged after step {step}"
+        if rank == 0:
+            print("P0 routed DDP gate passed: backend=gloo, world_size=2, steps=2")
+    finally:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

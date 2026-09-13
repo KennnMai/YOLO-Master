@@ -26,6 +26,7 @@ from torch import distributed as dist
 from torch import nn, optim
 
 from ultralytics.cfg import _YOLO_CLI_COMMAND, get_cfg, get_save_dir
+from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
 from ultralytics.engine.extensions import (
     AdapterRuntimeController,
     MixtureRuntimeController,
@@ -33,11 +34,16 @@ from ultralytics.engine.extensions import (
     update_args_with_lora_runtime_metadata,
     validate_adapter_configuration,
 )
-from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
+from ultralytics.engine.telemetry import TrainingTelemetry
 from ultralytics.nn.distill_model import DistillationModel
+from ultralytics.nn.foundation_distill_model import (
+    FoundationDistillationModel,
+    build_foundation_distillation_wrapper,
+    rebuild_foundation_distillation_wrapper,
+)
 from ultralytics.nn.mixture_loss import has_routed_modules
 from ultralytics.nn.tasks import load_checkpoint
-from ultralytics.optim import MuSGD
+from ultralytics.optim import MuSGD, audit_optimizer_param_groups
 from ultralytics.utils import (
     DEFAULT_CFG,
     LOCAL_RANK,
@@ -99,6 +105,12 @@ def _distributed_env() -> tuple[int, int, int] | None:
     return rank, local_rank, world_size
 
 
+def _reset_optimizer_accumulation_after_recovery(optimizer: optim.Optimizer) -> int:
+    """Clear restored gradients and restart the optimizer accumulation cursor for an epoch replay."""
+    optimizer.zero_grad()
+    return -1
+
+
 def _validate_cuda_ddp_device(device: torch.device, env: tuple[int, int, int] | None) -> None:
     """Fail before collectives when torchrun cannot bind the local CUDA ordinal."""
     if env is None:
@@ -135,12 +147,7 @@ def _optimizer_state_family(state_dict) -> str | None:
     groups = state_dict.get("param_groups", ())
     if any("use_muon" in group for group in groups):
         return "musgd"
-    state_keys = {
-        key
-        for state in state_dict.get("state", {}).values()
-        if isinstance(state, dict)
-        for key in state
-    }
+    state_keys = {key for state in state_dict.get("state", {}).values() if isinstance(state, dict) for key in state}
     if {"exp_avg", "exp_avg_sq"} <= state_keys:
         return "adam"
     if "square_avg" in state_keys:
@@ -246,6 +253,9 @@ class BaseTrainer:
         self.batch_size = self.args.batch
         self.epochs = self.args.epochs or 100  # in case users accidentally pass epochs=None with timed training
         self.start_epoch = 0
+        # Number of successful optimizer updates. Kept separate from epochs
+        # because gradient accumulation and resume can split an epoch.
+        self.optimizer_steps = 0
         if RANK == -1:
             print_args(vars(self.args))
 
@@ -255,6 +265,12 @@ class BaseTrainer:
 
         # Callbacks - initialize early so on_pretrain_routine_start can capture original args.data
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
+        self.training_telemetry = TrainingTelemetry.from_environment()
+        if self.training_telemetry.enabled:
+            self.add_callback("on_pretrain_routine_end", self.training_telemetry.on_pretrain_routine_end)
+            self.add_callback("on_train_batch_start", self.training_telemetry.on_train_batch_start)
+            self.add_callback("on_train_batch_end", self.training_telemetry.on_train_batch_end)
+            self.add_callback("teardown", self.training_telemetry.on_teardown)
 
         if self.device.type in {"cpu", "mps"}:
             world_size = 0
@@ -285,6 +301,9 @@ class BaseTrainer:
         self.loss = None
         self.tloss = None
         self.loss_names = ["Loss"]
+        self.foundation_metric_totals = {}
+        self.foundation_metric_steps = 0
+        self.foundation_metric_latest = {}
         self.csv = self.save_dir / "results.csv"
         if self.csv.exists() and not self.args.resume:
             self.csv.unlink()
@@ -365,6 +384,39 @@ class BaseTrainer:
             self.lf = lambda x: max(1 - x / self.epochs, 0) * (1.0 - self.args.lrf) + self.args.lrf  # linear
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)
 
+    def _audit_optimizer_groups(self):
+        """Capture and log a read-only snapshot of finalized optimizer parameter groups."""
+        audit = audit_optimizer_param_groups(self.model, self.optimizer, strict=False)
+        self.optimizer_group_audit = audit
+        if RANK not in {-1, 0}:
+            return audit
+        group_summary = ", ".join(
+            f"{group['index']}:{group['name']}"
+            f"(tensors={group['tensor_count']}, elements={group['total_element_count']}, "
+            f"lr={group['lr']}, decay={group['weight_decay']})"
+            for group in audit["groups"]
+        )
+        LOGGER.info(
+            f"{colorstr('optimizer audit:')} groups={audit['group_count']}, "
+            f"coverage={'complete' if audit['trainable_coverage_complete'] else 'incomplete'}, "
+            f"missing={audit['missing_trainable_count']}, duplicates={audit['duplicated_count']}, "
+            f"frozen={audit['frozen_in_optimizer_count']}, "
+            f"unknown={audit['unknown_optimizer_parameter_count']}; {group_summary}"
+        )
+        issue_samples = []
+        for issue_name in (
+            "missing_trainable",
+            "duplicated",
+            "frozen_in_optimizer",
+            "unknown_optimizer_parameters",
+        ):
+            if audit[issue_name]:
+                names = ", ".join(item["name"] for item in audit[issue_name][:5])
+                issue_samples.append(f"{issue_name}=[{names}]")
+        if issue_samples:
+            LOGGER.warning(f"{colorstr('optimizer audit:')} " + "; ".join(issue_samples))
+        return audit
+
     def _setup_ddp(self):
         """Initialize and set the DistributedDataParallel parameters for training."""
         index = int(self.args.device.split(",")[LOCAL_RANK])  # world_size > 1 guarantees a multi-device string
@@ -393,7 +445,15 @@ class BaseTrainer:
         )
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
-        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
+        # A custom batch sampler may intentionally use a different effective
+        # epoch length than the underlying dataset (weighted multi-source runs).
+        # Use its scheduled steps for optimizer/adapter warmup and decay.
+        train_size = (
+            len(self.train_loader)
+            if getattr(self, "task_sampler", None) is not None
+            else len(self.train_loader.dataset)
+        )
+        iterations = math.ceil(train_size / max(self.batch_size, self.args.nbs)) * self.epochs
         self.adapter_controller.prepare_optimizer(iterations)
         self.optimizer = self.build_optimizer(
             model=self.model,
@@ -404,6 +464,7 @@ class BaseTrainer:
             iterations=iterations,
         )
         self.adapter_controller.configure_optimizer(self.optimizer)
+        self._audit_optimizer_groups()
         self.args.effective_optimizer = type(self.optimizer).__name__
         self.args.effective_optimizer_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
         self._save_run_args()
@@ -424,7 +485,9 @@ class BaseTrainer:
 
         # Compile model (knowledge distillation runs the wrapped model eagerly and relies on
         # find_unused_parameters under DDP for the frozen teacher, so disable compilation when distilling)
-        if self.args.distill_model is not None and self.args.compile:
+        if (
+            self.args.distill_model is not None or getattr(self.args, "foundation_enabled", False)
+        ) and self.args.compile:
             LOGGER.warning("'compile' is not supported with knowledge distillation and will be disabled.")
             self.args.compile = False
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
@@ -450,7 +513,27 @@ class BaseTrainer:
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
         self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
         self.stride = gs  # for multiscale training
+        foundation_router_active = bool(
+            getattr(self.args, "foundation_router_distill", False)
+            and getattr(self.args, "foundation_router_loss_weight", 0.0) > 0
+        )
+        foundation_semantic_active = bool(
+            getattr(self.args, "foundation_semantic_distill", False)
+            and getattr(self.args, "foundation_semantic_loss_weight", 0.0) > 0
+        )
+        foundation_active = bool(
+            getattr(self.args, "foundation_enabled", False)
+            and (
+                getattr(self.args, "foundation_loss_weight", 0.0) > 0
+                or foundation_router_active
+                or foundation_semantic_active
+            )
+        )
 
+        # Build the opt-in Foundation wrapper after the student is on its training device.  The teacher is created once
+        # per process and is intentionally not registered as a child module, so it cannot enter DDP/optimizer/EMA state.
+        if foundation_active and not isinstance(unwrap_model(self.model), FoundationDistillationModel):
+            self.model = build_foundation_distillation_wrapper(self.model, self.args, device=self.device)
         # resume training would directly load DistillationModel so check here
         if self.args.distill_model is not None and not isinstance(unwrap_model(self.model), DistillationModel):
             self.model = DistillationModel(student_model=self.model, teacher_model=self.args.distill_model)
@@ -486,6 +569,9 @@ class BaseTrainer:
             self.loss_names = (*self.loss_names, "mixture_aux_loss")
         if self.args.distill_model is not None and "dis_loss" not in self.loss_names:
             self.loss_names += ("dis_loss",)
+        if foundation_active:
+            if "foundation" not in self.loss_names:
+                self.loss_names += ("foundation",)
         self.ema = ModelEMA(self.model)
         self.set_class_weights()  # compute class weights after dataloader is ready
         if RANK in {-1, 0}:
@@ -514,6 +600,16 @@ class BaseTrainer:
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         if isinstance(unwrap_model(self.model), DistillationModel):
             freeze_layer_names.append("teacher_model.")
+        if isinstance(unwrap_model(self.model), FoundationDistillationModel):
+            # The teacher-side projector is registered only so its shape is checkpointable; it must never be
+            # optimized or re-enabled by the generic frozen-parameter normalization below.
+            foundation_model = unwrap_model(self.model)
+            if foundation_model.multiscale:
+                freeze_layer_names.extend(
+                    f"_projectors.{level}.teacher_proj." for level in foundation_model.target_levels
+                )
+            else:
+                freeze_layer_names.append("_projector.teacher_proj.")
         self.freeze_layer_names = freeze_layer_names
         for name, parameter in self.model.named_parameters():
             if any(layer_name in name for layer_name in freeze_layer_names):
@@ -608,6 +704,9 @@ class BaseTrainer:
         self._oom_retries = 0  # OOM auto-reduce counter for first epoch
         while True:
             self.epoch = epoch
+            set_foundation_progress = getattr(unwrap_model(self.model), "set_foundation_progress", None)
+            if callable(set_foundation_progress):
+                set_foundation_progress(epoch, self.epochs)
             self.mixture_controller.begin_epoch(epoch)
             self.adapter_controller.begin_epoch(epoch)
             self.run_callbacks("on_train_epoch_start")
@@ -616,7 +715,8 @@ class BaseTrainer:
                 self.scheduler.step()
 
             self._model_train()
-            if RANK != -1:
+            self._reset_foundation_metric_state()
+            if not getattr(self.train_loader, "set_epoch", lambda _: False)(epoch) and RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
             pbar = enumerate(self.train_loader)
             # Update dataloader attributes (optional)
@@ -629,6 +729,7 @@ class BaseTrainer:
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
             for i, batch in pbar:
+                self.batch = batch
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
                 ni = i + nb * epoch
@@ -662,6 +763,7 @@ class BaseTrainer:
                                 loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
                             else:
                                 loss, self.loss_items = self.model(batch)
+                            self._collect_foundation_metrics()
                             self.mixture_controller.collect_routing_usage(batch_weight=batch["img"].shape[0])
                             loss = self.adapter_controller.augment_loss(loss)
                             loss = self.adapter_controller.augment_few_shot_loss(loss, batch["img"], epoch)
@@ -750,18 +852,20 @@ class BaseTrainer:
 
             # Validation
             final_epoch = epoch + 1 >= self.epochs
-            validated = self._sync_validation_gate(
-                self.args.val or final_epoch or self.stopper.possible_stop or self.stop
-            )
+            validated = self._sync_validation_gate(self.args.val)
             if validated:
                 self._clear_memory(None if self.device.type == "mps" else 0.5)  # prevent VRAM spike
                 if self._recover_before_validation(epoch):
-                    self._finalize_moe_map_saturation_epoch(recovered=True, validated=True)
+                    last_opt_step = _reset_optimizer_accumulation_after_recovery(self.optimizer)
+                    self._finalize_moe_map_saturation_epoch(recovered=True, validated=False)
                     continue
                 self.metrics, self.fitness = self.validate()
 
             # NaN recovery
             if self._handle_nan_recovery(epoch):
+                # The same epoch is replayed from a restored optimizer state. Keeping the previous pass's
+                # accumulation cursor suppresses optimizer steps until the replay catches up with that index.
+                last_opt_step = _reset_optimizer_accumulation_after_recovery(self.optimizer)
                 self._finalize_moe_map_saturation_epoch(recovered=True, validated=validated)
                 continue
             self._finalize_moe_map_saturation_epoch(recovered=False, validated=validated)
@@ -770,6 +874,9 @@ class BaseTrainer:
             rank0_epoch_end_error = None
             if RANK in {-1, 0}:
                 try:
+                    foundation_metrics = self._mean_foundation_metrics(prefix="train/")
+                    if foundation_metrics:
+                        self.metrics = {**(self.metrics or {}), **foundation_metrics}
                     self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                     self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                     if self.args.time:
@@ -813,8 +920,9 @@ class BaseTrainer:
 
         seconds = time.time() - self.train_time_start
         LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
-        # Do final val with best.pt
-        self.final_eval()
+        if self.args.val:
+            # Do final val with best.pt only when validation was requested.
+            self.final_eval()
         if RANK in {-1, 0}:
             if self.args.plots:
                 self.plot_metrics()
@@ -943,6 +1051,20 @@ class BaseTrainer:
         elif self.args.pretrained is False and not self.resume:
             weights = None
 
+        # Rebuild FoundationDistillationModel from a checkpoint while keeping the teacher outside checkpoint state.
+        if isinstance(weights, FoundationDistillationModel):
+            student_model = self.get_model(cfg=cfg, weights=weights.student_model, verbose=RANK in {-1, 0})
+            student_model.args = self.args
+            self.model = rebuild_foundation_distillation_wrapper(
+                student_model,
+                self.args,
+                checkpoint_model=weights,
+                device=self.device,
+            )
+            if isinstance(self.model, nn.Module):
+                self.model.criterion = None
+            return ckpt
+
         # rebuild DistillationModel from resuming checkpoint
         if isinstance(weights, DistillationModel):
             if RANK in {-1, 0}:
@@ -963,9 +1085,8 @@ class BaseTrainer:
     def optimizer_step(self):
         """Perform a single step of the training optimizer with gradient clipping and EMA update."""
         self.scaler.unscale_(self.optimizer)  # unscale gradients
-        local_nonfinite = any(
-            parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all().item())
-            for parameter in self.model.parameters()
+        local_nonfinite = not self._recovery_controller().tensors_are_finite(
+            parameter.grad for parameter in self.model.parameters() if parameter.grad is not None
         )
         if self._sync_nonfinite_flag(local_nonfinite):
             self._gradient_nonfinite = True
@@ -979,6 +1100,7 @@ class BaseTrainer:
         if controller is not None:
             controller.after_optimizer_step()
         self.optimizer.zero_grad()
+        self.optimizer_steps = int(getattr(self, "optimizer_steps", 0)) + 1
         if self.ema:
             self.ema.update(self.model)
         return True
@@ -1000,7 +1122,15 @@ class BaseTrainer:
             adapter_controller.sync_ema_treatment()
         self._sync_ema_buffers_for_validation()
         ema_model = getattr(getattr(self, "ema", None), "ema", None)
-        if ema_model is not None and not self._state_is_finite(unwrap_model(ema_model)):
+        finite_checker = getattr(self, "_state_is_finite", None)
+        ema_finite = (
+            finite_checker(unwrap_model(ema_model))
+            if ema_model is not None and finite_checker is not None
+            else self._recovery_controller().state_is_finite_batched(unwrap_model(ema_model))
+            if ema_model is not None
+            else True
+        )
+        if ema_model is not None and not ema_finite:
             self._ema_nonfinite = True
             return {}, float("nan")
         self._ema_nonfinite = False
@@ -1083,7 +1213,7 @@ class BaseTrainer:
         finite_state = None
         if live_state_available:
             finite_state = all(
-                self._state_is_finite(state)
+                self._recovery_controller().state_is_finite_batched(state)
                 for state in (
                     unwrap_model(model),
                     getattr(getattr(self, "ema", None), "ema", None),
@@ -1114,18 +1244,18 @@ class BaseTrainer:
 
     def _collect_prevalidation_nonfinite_flags(self):
         """Collect model and EMA non-finite flags across initialized ranks."""
-        model_nonfinite = getattr(self, "model", None) is not None and not self._state_is_finite(
-            unwrap_model(self.model)
-        )
+        model_nonfinite = getattr(
+            self, "model", None
+        ) is not None and not self._recovery_controller().state_is_finite_batched(unwrap_model(self.model))
         ema = getattr(getattr(self, "ema", None), "ema", None)
-        ema_nonfinite = ema is not None and not self._state_is_finite(unwrap_model(ema))
+        ema_nonfinite = ema is not None and not self._recovery_controller().state_is_finite_batched(unwrap_model(ema))
         return {
             "model_nonfinite": self._sync_nonfinite_flag(model_nonfinite),
             "ema_nonfinite": self._sync_nonfinite_flag(ema_nonfinite),
         }
 
     def _recover_before_validation(self, epoch):
-        """Recover before validation if the online or EMA model is already non-finite."""
+        """Return whether to replay the epoch after prevalidation recovery; EMA-only resync needs no replay."""
         flags = self._collect_prevalidation_nonfinite_flags()
         if flags["ema_nonfinite"]:
             self._recovery_controller().resync_nonfinite_ema()
@@ -1135,9 +1265,9 @@ class BaseTrainer:
         self.fitness = float("nan")
         recovered = self._handle_nan_recovery(epoch)
         if recovered:
-            # The live graph is finite again. Validate and checkpoint the restored state
-            # instead of replaying an epoch that may repeat a deterministic callback fault.
-            return False
+            # Rolling back the online model discards this attempt's updates. Replay it without
+            # committing stale metrics or clearing the consecutive recovery budget.
+            return True
         return any(self._collect_prevalidation_nonfinite_flags().values())
 
     def _record_nonfinite_diagnostic(self, component, *, epoch, step, loss_items=None, parameter=None):
@@ -1174,6 +1304,36 @@ class BaseTrainer:
             This is not needed for classification but necessary for segmentation & detection.
         """
         return {"loss": loss_items} if loss_items is not None else ["loss"]
+
+    def _reset_foundation_metric_state(self) -> None:
+        """Reset per-epoch Foundation metric aggregation without touching model or optimizer state."""
+        self.foundation_metric_totals = {}
+        self.foundation_metric_steps = 0
+        self.foundation_metric_latest = {}
+
+    def _collect_foundation_metrics(self) -> None:
+        """Collect the latest Foundation wrapper metrics after a train forward pass."""
+        model = unwrap_model(self.model)
+        metrics_fn = getattr(model, "foundation_metrics", None)
+        if not callable(metrics_fn):
+            return
+        metrics = metrics_fn()
+        if not isinstance(metrics, dict) or not metrics:
+            return
+        numeric = {str(key): float(value) for key, value in metrics.items()}
+        self.foundation_metric_latest = numeric
+        self.foundation_metric_steps += 1
+        for key, value in numeric.items():
+            self.foundation_metric_totals[key] = self.foundation_metric_totals.get(key, 0.0) + value
+
+    def _mean_foundation_metrics(self, prefix: str = "") -> dict[str, float]:
+        """Return per-epoch Foundation metric means with an optional output-key prefix."""
+        if self.foundation_metric_steps <= 0:
+            return {}
+        return {
+            f"{prefix}{key}": value / self.foundation_metric_steps
+            for key, value in self.foundation_metric_totals.items()
+        }
 
     def set_model_attributes(self):
         """Set or update model parameters before training."""
@@ -1275,6 +1435,8 @@ class BaseTrainer:
                     "save_period",
                     "workers",
                     "cache",
+                    "epochs",
+                    "fraction",
                     "patience",
                     "time",
                     "freeze",
@@ -1327,13 +1489,21 @@ class BaseTrainer:
                     LOGGER.warning("[PEFT] Resume optimizer state is incompatible; using the initialized optimizer.")
         if ckpt.get("scaler") is not None:
             self.scaler.load_state_dict(ckpt["scaler"])
+        self.optimizer_steps = int(ckpt.get("optimizer_steps", getattr(self, "optimizer_steps", 0)))
         if self.ema and ckpt.get("ema"):
             from ultralytics.nn.mixture_loss import initialize_mixture_loss_ema_buffer
 
             online_target = unwrap_model(self.model)
             online_mixture_ema = initialize_mixture_loss_ema_buffer(online_target)
-            ema_state = ckpt["ema"].float().state_dict()
+            checkpoint_ema = ckpt["ema"].float()
+            # Apply the same lazy initializer/migration used by live models before
+            # extracting state, so legacy three-slot checkpoints load into the
+            # current four-slot online and EMA buffers without a size mismatch.
+            initialize_mixture_loss_ema_buffer(checkpoint_ema)
+            ema_state = checkpoint_ema.state_dict()
             checkpoint_mixture_ema = ema_state.get("_mixture_loss_ema_buf")
+            if checkpoint_mixture_ema is None:
+                checkpoint_mixture_ema = ema_state.get("student_model._mixture_loss_ema_buf")
             if checkpoint_mixture_ema is not None:
                 online_mixture_ema.copy_(
                     checkpoint_mixture_ema.to(device=online_mixture_ema.device, dtype=online_mixture_ema.dtype)
@@ -1350,6 +1520,9 @@ class BaseTrainer:
                 ema_target.load_state_dict(ema_state, strict=False)
             self.ema.updates = ckpt["updates"]
         self.best_fitness = ckpt.get("best_fitness")
+        restore_runtime_state = getattr(self, "restore_checkpoint_runtime_state", None)
+        if callable(restore_runtime_state):
+            restore_runtime_state(ckpt.get("runtime_state", {}))
 
     def _restore_lora_resume_model(self, ckpt):
         """Restore adapter-only EMA weights into the online model before optimizer state loading."""
@@ -1506,6 +1679,22 @@ class BaseTrainer:
                     g[1][fullname] = param
                 else:  # weight (with decay)
                     g[0][fullname] = param
+        trainable = {id(parameter): name for name, parameter in model.named_parameters() if parameter.requires_grad}
+        memberships = {}
+        for group_index, group in enumerate(g):
+            for parameter in group.values():
+                memberships.setdefault(id(parameter), []).append(group_index)
+        missing = sorted(trainable[parameter_id] for parameter_id in trainable.keys() - memberships.keys())
+        duplicated = sorted(
+            trainable[parameter_id]
+            for parameter_id, groups in memberships.items()
+            if parameter_id in trainable and len(groups) != 1
+        )
+        if missing or duplicated:
+            raise RuntimeError(
+                "optimizer trainable-parameter partition is incomplete: "
+                f"missing={missing[:8]}, duplicated={duplicated[:8]}"
+            )
         num_params = [len(g[0]), len(g[1]), len(g[2]), len(g[4]), len(g[5])]  # parameters by policy
         if use_muon:
             router_index, adapter_index = 4, 5

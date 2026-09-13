@@ -62,6 +62,7 @@ def _valid_input(batch=2, channels=IN_CHANNELS, h=16, w=16):
 # _validate_router_input unit tests
 # =============================================================================
 
+
 class TestValidateRouterInput:
     def test_valid_4d_input_passes(self):
         x = _valid_input()
@@ -99,7 +100,9 @@ class TestValidateRouterInput:
 
         monkeypatch.setenv("ULTRA_DEBUG_NONFINITE", "1")
         monkeypatch.setenv("ULTRA_DEBUG_POST_URL", "http://127.0.0.1:9/collect")
-        monkeypatch.setattr(routers, "urlopen", lambda *args, **kwargs: pytest.fail("network post attempted"), raising=False)
+        monkeypatch.setattr(
+            routers, "urlopen", lambda *args, **kwargs: pytest.fail("network post attempted"), raising=False
+        )
         with pytest.raises(MoERouterError):
             _validate_router_input(torch.full((1, IN_CHANNELS, 2, 2), float("nan")), IN_CHANNELS)
 
@@ -107,6 +110,7 @@ class TestValidateRouterInput:
 # =============================================================================
 # UltraEfficientRouter boundary tests
 # =============================================================================
+
 
 class TestUltraEfficientRouterBoundaries:
     def test_valid_forward(self, ultra_router):
@@ -149,6 +153,7 @@ class TestUltraEfficientRouterBoundaries:
 # EfficientSpatialRouter boundary tests
 # =============================================================================
 
+
 class TestEfficientSpatialRouterBoundaries:
     def test_valid_forward(self, spatial_router):
         x = _valid_input()
@@ -173,7 +178,9 @@ class TestEfficientSpatialRouterBoundaries:
             spatial_router(_valid_input())
 
     def test_nonfinite_internal_router_output_raises(self, spatial_router, monkeypatch):
-        monkeypatch.setattr(spatial_router.router, "forward", lambda _: torch.full((2, NUM_EXPERTS, 1, 1), float("nan")))
+        monkeypatch.setattr(
+            spatial_router.router, "forward", lambda _: torch.full((2, NUM_EXPERTS, 1, 1), float("nan"))
+        )
         with pytest.raises(MoERouterError, match="internal output"):
             spatial_router(_valid_input())
 
@@ -181,6 +188,7 @@ class TestEfficientSpatialRouterBoundaries:
 # =============================================================================
 # AdaptiveRoutingLayer boundary tests
 # =============================================================================
+
 
 class TestAdaptiveRoutingLayerBoundaries:
     def test_valid_forward(self, adaptive_router):
@@ -198,6 +206,7 @@ class TestAdaptiveRoutingLayerBoundaries:
 # =============================================================================
 # LocalRoutingLayer boundary tests
 # =============================================================================
+
 
 class TestLocalRoutingLayerBoundaries:
     def test_valid_forward(self, local_router):
@@ -250,18 +259,36 @@ class TestDynamicRoutingLayerBoundaries:
             router(torch.randn(2, IN_CHANNELS // 2, 16, 16))
 
 
-def test_capacity_overflow_is_distributed_round_robin():
+def test_capacity_is_per_expert_and_handles_biased_routing():
     from ultralytics.nn.modules.moe.routers import BaseRouter
 
-    router = BaseRouter(num_experts=4, top_k=1, capacity_factor=0.5)
-    router.train()
-    logits = torch.zeros(12, 4)
+    router = BaseRouter(num_experts=4, top_k=2, capacity_factor=0.5)
+    logits = torch.tensor([[9.0, 8.0, 0.0, -1.0]]).repeat(8, 1)
     weights, indices, info = router._process_logits(logits, noise_std=0.0, training=True)
-    assert info["overflow_count"] == 10
-    assert info["overflow_fraction"] == pytest.approx(10 / 12)
-    assert torch.equal(info["overflow_mask"], torch.tensor([False, False] + [True] * 10))
-    assert set(indices[-10:, 0].tolist()) == {0, 1, 2, 3}
-    assert torch.equal(weights[-10:], torch.ones(10, 1))
+
+    assert info["capacity_limit"] == 2  # ceil(0.5 * 8 * 2 / 4)
+    assert info["overflow_count"] == 12
+    assert info["overflow_fraction"] == pytest.approx(12 / 16)
+    assert info["overflow_mask"].shape == indices.shape
+    for expert in range(4):
+        accepted = (indices == expert) & ~info["overflow_mask"]
+        assert accepted.sum().item() <= info["capacity_limit"]
+    assert torch.equal(indices[2:, 0], torch.zeros(6, dtype=torch.long))
+    assert torch.equal(weights[2:], torch.tensor([[1.0, 0.0]]).repeat(6, 1))
+    assert torch.allclose(weights.sum(dim=1), torch.ones(8))
+
+
+def test_capacity_indices_and_weights_drop_the_same_assignments():
+    from ultralytics.nn.modules.moe.routers import BaseRouter
+
+    router = BaseRouter(num_experts=3, top_k=2, capacity_factor=0.75)
+    logits = torch.tensor([[7.0, 6.0, 0.0], [7.0, 6.0, 0.0], [7.0, 6.0, 0.0]])
+    weights, indices, info = router._process_logits(logits, noise_std=0.0, training=True)
+
+    assert info["capacity_limit"] == 2
+    assert torch.equal(info["overflow_mask"][2], torch.tensor([True, True]))
+    assert indices[2, 0].item() == 0
+    assert torch.equal(weights[2], torch.tensor([1.0, 0.0]))
 
 
 def test_capacity_overflow_is_deterministic_across_repeated_calls():
@@ -269,25 +296,36 @@ def test_capacity_overflow_is_deterministic_across_repeated_calls():
 
     router = BaseRouter(num_experts=4, top_k=2, capacity_factor=0.5)
     logits = torch.zeros(12, 4)
-    first = router._process_logits(logits, noise_std=0.0, training=True)[1]
-    second = router._process_logits(logits, noise_std=0.0, training=True)[1]
-    assert torch.equal(first, second)
+    first = router._process_logits(logits, noise_std=0.0, training=True)
+    second = router._process_logits(logits, noise_std=0.0, training=True)
+    assert torch.equal(first[0], second[0])
+    assert torch.equal(first[1], second[1])
+    assert torch.equal(first[2]["overflow_mask"], second[2]["overflow_mask"])
 
 
 def test_capacity_overflow_hard_forward_retains_router_gradient():
     from ultralytics.nn.modules.moe.routers import BaseRouter
 
-    router = BaseRouter(num_experts=4, top_k=1, capacity_factor=0.5)
-    logits = torch.randn(12, 4, requires_grad=True)
+    router = BaseRouter(num_experts=4, top_k=2, capacity_factor=0.5)
+    logits = torch.tensor([[9.0, 8.0, 0.0, -1.0]]).repeat(12, 1).requires_grad_()
     weights, _, info = router._process_logits(logits, noise_std=0.0, training=True)
-    overflow = info["overflow_mask"]
+    overflow = info["token_overflow_mask"]
 
-    assert torch.equal(weights[overflow].detach(), torch.ones(10, 1))
-    weights[overflow].sum().backward()
+    assert torch.equal(weights[overflow].detach(), torch.tensor([[1.0, 0.0]]).repeat(overflow.sum(), 1))
+    weights[overflow, 0].sum().backward()
 
     overflow_gradient = logits.grad[overflow]
     assert torch.isfinite(overflow_gradient).all()
     assert torch.count_nonzero(overflow_gradient).item() > 0
+
+
+@pytest.mark.parametrize("capacity_factor", [0.0, -1.0, float("nan"), float("inf")])
+def test_capacity_factor_must_be_positive_and_finite(capacity_factor):
+    from ultralytics.nn.modules.moe.routers import BaseRouter
+
+    router = BaseRouter(num_experts=4, top_k=1, capacity_factor=capacity_factor)
+    with pytest.raises(MoERouterError, match="capacity_factor"):
+        router._process_logits(torch.zeros(2, 4), noise_std=0.0, training=True)
 
     def test_nonfinite_internal_output_raises(self, monkeypatch):
         router = DynamicRoutingLayer(IN_CHANNELS, NUM_EXPERTS, top_k=TOP_K)
@@ -303,6 +341,7 @@ def test_capacity_overflow_hard_forward_retains_router_gradient():
 # =============================================================================
 # Exception hierarchy tests
 # =============================================================================
+
 
 class TestExceptionHierarchy:
     def test_moerouter_error_inherits_yolomaster(self):
@@ -322,6 +361,7 @@ class TestExceptionHierarchy:
 # =============================================================================
 # FP16 routing precision regressions
 # =============================================================================
+
 
 class TestABlockMoEDiagnostics:
     def test_diagnostics_fail_at_first_nonfinite_boundary(self, monkeypatch):

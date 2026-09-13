@@ -9,10 +9,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ultralytics.nn.modules._numeric import FP32RouterMixin, disabled_autocast, stable_normalize
+from ultralytics.nn.modules._numeric import (
+    FP32RouterMixin,
+    deterministic_topk_indices,
+    disabled_autocast,
+    stable_normalize,
+)
 from ultralytics.nn.modules.moe import loss as _moe_loss
 from ultralytics.nn.modules.routing_protocol import graph_connected_finite_zero
 from ultralytics.nn.modules.routing_protocol import routing_finite_diagnostics
+from ultralytics.nn.modules.topk_contract import DEFAULT_DETERMINISTIC_TOPK
 from ultralytics.nn.modules.utils import get_safe_groups as _safe_groups
 from ultralytics.nn.modules.mot._constants import (
     DEFAULT_MIN_TEMPERATURE,
@@ -87,6 +93,7 @@ class _MoTRouter(FP32RouterMixin, nn.Module):
         scene_aware: bool = False,
         scene_hidden_dim: Optional[int] = None,
         scene_inference_mode: str = "dynamic",
+        export_masked: bool = True,
     ):
         super().__init__()
         if num_experts < 1:
@@ -102,6 +109,13 @@ class _MoTRouter(FP32RouterMixin, nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.use_spatial = use_spatial
+        # When True (default), exported graphs rebuild the renormalized Top-K
+        # weights with static traceable ops so the artifact matches the eager
+        # sparse path numerically. Pass False to keep the legacy dense-softmax
+        # export fallback.
+        self.export_masked = bool(export_masked)
+        self.route_tie_tolerance = 1e-6
+        self.route_tie_break = DEFAULT_DETERMINISTIC_TOPK
         # Register temperature as a buffer so checkpoint save/restore
         # preserves annealing progress (Python float would be lost).
         self.register_buffer("temperature", torch.tensor(max(temperature, 0.1)), persistent=True)
@@ -153,11 +167,12 @@ class _MoTRouter(FP32RouterMixin, nn.Module):
             hidden = int(hidden_dim or self.scene_hidden_dim or 3)
             if hidden <= 0:
                 raise ValueError("scene_hidden_dim must be positive")
+            reference = next(self.router.parameters())
             self.scene_projector = nn.Sequential(
                 nn.Linear(3, hidden),
                 nn.SiLU(inplace=False),
                 nn.Linear(hidden, self.num_experts),
-            )
+            ).to(device=reference.device, dtype=torch.float32)
             nn.init.zeros_(self.scene_projector[-1].weight)
             nn.init.zeros_(self.scene_projector[-1].bias)
             self.scene_hidden_dim = hidden
@@ -168,7 +183,8 @@ class _MoTRouter(FP32RouterMixin, nn.Module):
         """Compute differentiable high-frequency, heterogeneity, and scale statistics."""
         feature = x.float()
         eps = torch.finfo(feature.dtype).eps
-        rms = feature.square().mean(dim=(1, 2, 3)).sqrt().clamp_min(eps)
+        squared = feature.square()
+        rms = squared.mean(dim=(1, 2, 3)).sqrt().clamp_min(eps)
 
         dx = (feature[..., 1:] - feature[..., :-1]).abs().mean(dim=(1, 2, 3)) if feature.shape[-1] > 1 else rms * 0
         dy = (
@@ -176,7 +192,7 @@ class _MoTRouter(FP32RouterMixin, nn.Module):
         )
         high_frequency = 0.5 * (dx + dy) / rms
 
-        spatial_energy = feature.square().mean(dim=1)
+        spatial_energy = squared.mean(dim=1)
         heterogeneity = spatial_energy.flatten(1).std(dim=1, unbiased=False) / spatial_energy.flatten(1).mean(
             dim=1
         ).clamp_min(eps)
@@ -238,7 +254,9 @@ class _MoTRouter(FP32RouterMixin, nn.Module):
         # Also clamp the z_loss result itself to prevent inf propagation
         return ((log_z**2).clamp(max=ROUTER_Z_LOSS_LIMIT)).mean()
 
-    def forward(self, x: torch.Tensor, return_logits: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, return_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]] | Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
         Returns:
             weights : [B, num_experts, H, W] or [B, num_experts, 1, 1]  (soft, sum-to-1)
@@ -257,10 +275,38 @@ class _MoTRouter(FP32RouterMixin, nn.Module):
             weights = F.softmax(logits / temp.float(), dim=1)  # [B, E, H, W]
         dense_weights = weights
 
+        # ONNX and TorchScript tracing use dense blending. Besides being the
+        # documented export semantics, avoiding Top-K/scatter here prevents a
+        # PyTorch 2.9 legacy-exporter alias-analysis failure on bool scatter_.
+        exporting = torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()
+        if exporting:
+            if self.export_masked and self.top_k < self.num_experts:
+                # Export-time parity with the eager sparse path: rebuild the
+                # renormalized Top-K weights using only static, traceable ops
+                # (broadcast-compare mask instead of scatter_, which trips the
+                # PyTorch 2.9 legacy exporter's alias analysis on bool masks).
+                # The exported graph stays dense (every expert runs), but its
+                # weights equal the sparse path's, so artifact outputs match
+                # eager sparse execution numerically.
+                _, topk_idx = weights.topk(self.top_k, dim=1)
+                expert_range = torch.arange(self.num_experts, device=weights.device).view(1, -1, 1, 1)
+                mask = torch.zeros_like(weights)
+                for k in range(self.top_k):
+                    mask = mask + (expert_range == topk_idx[:, k : k + 1]).to(weights.dtype)
+                weights = stable_normalize(weights * mask.clamp(max=1.0), dim=1)
+            indices = None
         # Top-K mask
-        if self.top_k < self.num_experts:
+        elif self.top_k < self.num_experts:
             # get top-k indices [B, K, H, W]
-            topk_vals, topk_idx = weights.topk(self.top_k, dim=1)
+            tie_tolerance = float(getattr(self, "route_tie_tolerance", 1e-6))
+            tie_break = str(getattr(self, "route_tie_break", DEFAULT_DETERMINISTIC_TOPK))
+            topk_idx = deterministic_topk_indices(
+                weights,
+                self.top_k,
+                tie_tolerance=tie_tolerance,
+                tie_break=tie_break,
+            )
+            topk_vals = weights.gather(1, topk_idx)
             # renormalize selected weights
             topk_weights = stable_normalize(topk_vals, dim=1)
             # scatter back to [B, E, H, W] sparse

@@ -29,13 +29,28 @@ struct LetterboxInfo {
     int pad_x = 0, pad_y = 0, orig_w = 0, orig_h = 0;   // pad is 0 in stretch mode
 };
 
+// NMS variant: Standard = plain per-class greedy; ClusterWeighted = greedy survivors get a
+// post-hoc coordinate refinement (weighted average over their cluster; ultralytics cluster
+// branch semantics). Survivor set/order/scores/classes are identical - only rects move.
+enum class NmsMode { Standard, ClusterWeighted };
+
 struct Config {
     int imgsz = 640;
     float conf_thresh = 0.25f;    // low default: VisDrone small/dense objects
     float iou_thresh  = 0.50f;
+    // Optional area-adaptive confidence floor used by the VisDrone NMS sweep.
+    // A negative value disables the override; when enabled, boxes whose
+    // original-image area is below `small_area` use the lower of the global
+    // and small-object thresholds.  Keeping this disabled by default retains
+    // generic detector behaviour while allowing Python and C++ validation runs
+    // to share one explicit small-object policy.
+    float small_conf_thresh = -1.f;
+    float small_area = 32.f * 32.f;
     int   max_det = 300;          // cap detections after NMS (ultralytics val default)
     bool  multi_label = false;    // true = one detection per class>conf per anchor (ultralytics val); false = argmax
     bool  stretch = false;        // preprocess: false = letterbox (aspect-preserving); true = stretch to square
+    NmsMode nms_mode = NmsMode::Standard;
+    float cw_sigma = 0.1f;        // CW-NMS weight falloff: w = score * exp(-(1-IoU)^2 / sigma)
     std::vector<std::string> class_names;
     int num_classes() const { return static_cast<int>(class_names.size()); }
 };
@@ -51,6 +66,12 @@ cv::Mat letterbox(const cv::Mat& img, int imgsz, LetterboxInfo& info);
 // Decode raw model output -> pre-NMS candidates (score >= cfg.conf_thresh; pass a low floor to cache).
 std::vector<RawDet> decode_candidates(const float* out, int feat_dim, int num_anchors,
                                       const Config& cfg, const LetterboxInfo& lb);
+// Explicit-layout overload for backends that can disambiguate an objectness
+// channel from segmentation mask coefficients using the model's prototype
+// output.  This is required for ``4 + 1 + nc + nm`` heads.
+std::vector<RawDet> decode_candidates(const float* out, int feat_dim, int num_anchors,
+                                      const Config& cfg, const LetterboxInfo& lb,
+                                      bool has_objectness);
 // Per-class NMS + max_det cap + clip-to-frame on cached candidates (cheap; re-run on conf/IoU change).
 std::vector<Detection> nms_and_cap(const std::vector<RawDet>& cands, const Config& cfg,
                                    int orig_w, int orig_h);
@@ -72,16 +93,27 @@ const float* class_color(int class_id);   // returns pointer to 3 floats
 namespace meta {
 // parse a python-dict string "{0: 'pedestrian', 1: 'people', ...}" -> ordered names
 std::vector<std::string> parse_names_dict(const std::string& s);
-// parse an ultralytics ncnn metadata.yaml sidecar -> names + imgsz (false if unusable)
-bool read_ncnn_yaml(const std::string& yaml_path, std::vector<std::string>& names, int& imgsz);
+// Parse an ultralytics ncnn metadata.yaml sidecar -> names + imgsz.  Optional
+// blob-name outputs let the runtime follow pnnx graphs whose tensors are not
+// named in0/out0/out1.  Existing callers may omit the optional pointers.
+bool read_ncnn_yaml(const std::string& yaml_path, std::vector<std::string>& names, int& imgsz,
+                    std::string* input_blob = nullptr, std::string* output_blob = nullptr,
+                    std::string* proto_blob = nullptr);
 }
 
 // ---- versatile input source ----
-enum class SourceKind { Image, Dir, Video, Dataset, Unknown };
+enum class SourceKind { Image, Dir, Video, Dataset, List, Unknown };
 SourceKind classify_source(const std::string& src);
-// image list for Image/Dir/Dataset (Video is streamed separately by the caller).
-// For Dataset (.yaml) it resolves the `val` split best-effort. `limit` caps count (0 = all).
+// image list for Image/Dir/Dataset/List (Video is streamed separately by the caller).
+// A .txt/.list List is newline-delimited and preserves file order; relative entries are
+// resolved against the list's directory. For Dataset (.yaml) the `val` split
+// accepts a scalar, an inline sequence, or a block sequence of directories,
+// image-list files, or image files. `limit` caps count (0 = all).
 std::vector<std::string> gather_images(const std::string& src, int limit);
+// Evidence runs require a one-to-one mapping between an image and its
+// per-image prediction file. Compare stems case-insensitively so a run has
+// identical semantics on Windows and Linux.
+bool validate_unique_stems(const std::vector<std::string>& images, std::string& error);
 
 // ---- backend interface ----
 class Backend {
