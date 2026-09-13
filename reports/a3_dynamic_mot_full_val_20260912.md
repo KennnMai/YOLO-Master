@@ -142,9 +142,14 @@ NumPy 参考后端，用于冻结接口和验证“未选专家不执行”，�
 `1e-6` deadband 边界。与旧策略下的 173 个漂移相比，固定 deadband 没有消除离散不连续性，而是把翻转
 位置迁移到新的阈值边界。因此不能继续增大容差并挑选一个数据集上恰好为零的值来宣称普适确定性。
 
-下一步应把“部署导出的路由结果”定义为唯一权威选择，或建立带误差预算的歧义等价门禁；若验收仍要求
-逐位置绝对相同，则 eager 对照和动态执行必须复用同一个路由后端/同一份路由输出。在此合同澄清前不扩展
-动态 INT8，也不进入 CUDA/TensorRT 性能宣称。
+本地实现现已选择第一条路线：提交 `aac33de` 把 `exported_router_host_topk` 写入新 bundle，并要求实际
+checkpoint 专家 dispatch 与该权威路由的审计完全一致。验证器新增 `exported_authoritative` 模式；eager
+路由漂移仍原样记录为诊断，状态使用 `PASS_WITH_REFERENCE_ROUTE_DRIFT`，不会伪装成零漂移。旧的
+`--require-exact-route` 继续映射到 `exact_reference`，所以既有严格实验不会被静默改写。
+
+下一次云端只需重新导出 6 个 bundle 并验证这套“权威路由—实际调用”合同；若验收仍要求 eager/ORT
+逐位置绝对相同，则两条路径必须复用同一个路由后端/同一份路由输出。在此闭环前不扩展动态 INT8，也不进入
+CUDA/TensorRT 性能宣称。
 
 ## 尚不可声明
 

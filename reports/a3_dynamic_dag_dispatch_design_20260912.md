@@ -56,6 +56,20 @@ dispatch 节点的实际专家 ID、样本/专家对数量和相对 dense 的缩
 - 空间路由应进一步支持 token/window 分组，避免 batch union 覆盖全专家；
 - 正确性通过后才测 warmup、重复次数、P50/P95、吞吐和显存。
 
+## 导出路由权威合同
+
+提交 `aac33de` 明确选择 `exported_router_host_topk` 作为部署路由权威来源：
+
+- 新 bundle 和模型清单显式记录 `route_authority` 与 `reference_route_role`；
+- ORT router 输出经过 manifest 指定的 host Top-K 后直接驱动 checkpoint 专家，不再由 eager 路由改写；
+- adapter 对每次实际专家调用与权威路由审计进行核对；
+- `exported_authoritative` 门禁要求所有块声明该合同且每次 dispatch 均通过核对；
+- eager checkpoint 路由仍逐位置审计，漂移时状态写作 `PASS_WITH_REFERENCE_ROUTE_DRIFT`；
+- `exact_reference` 模式及 `--require-exact-route` 保留，继续支持研究型严格一致实验。
+
+误差预算只用于解释跨后端浮点边界，不用于替换实际专家 ID 或把漂移隐藏为一致。这一区分把“部署路径是否
+忠实执行自己声明的路由”和“两个浮点后端是否产生相同离散路由”拆成了两个可独立审查的问题。
+
 ## 本地验证
 
 - Ruff：相关 Python 文件通过。
@@ -73,9 +87,6 @@ eager/动态混合复验。mAP50-95 绝对差为 `0.0001124859` 个百分点，6
 严格路由门禁因 196 个位置漂移失败。证据摘要见
 [`evidence/a3_dynamic_mot_20260912/deterministic_topk_full_val_summary.json`](evidence/a3_dynamic_mot_20260912/deterministic_topk_full_val_summary.json)。
 
-下一次云端 GPU 触发点不应是继续扫描 deadband，而应在路由权威语义确定之后验证以下二选一实现：
-
-1. eager 对照与动态执行复用同一导出路由输出，检查专家 dispatch 和最终 mAP；或
-2. 使用显式跨后端误差预算，把边界内候选视为同一歧义集合，同时继续单独报告实际专家 ID。
-
-只有路由正确性合同闭环后，才开始 CUDA/TensorRT backend 和 P50/P95 性能验证。
+路由权威语义已经在本地实现。下一次云端 GPU 只验证新导出的 6 个 bundle 是否全部声明权威合同、实际专家
+dispatch 是否逐调用吻合、548 张 mAP 是否继续过门，并继续报告原始 eager 参考漂移。不要再扫描 deadband。
+只有该正确性合同闭环后，才开始 CUDA/TensorRT backend 和 P50/P95 性能验证。

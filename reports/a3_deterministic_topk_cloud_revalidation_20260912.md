@@ -9,6 +9,9 @@ checkpoint 的 6 个动态块，并在 VisDrone val 548 张上比较：
 - ORT CPU 路由器 + 确定性 host Top-K + GPU PyTorch checkpoint 专家；
 - mAP50-95 差值、逐位置路由漂移、真实专家调用及缩减。
 
+部署门禁采用 `exported_authoritative`：导出 router 的 dense 概率经过版本化 host Top-K 后是 dispatch 的唯一
+权威路由；eager checkpoint 路由仍逐位置比较和报告，但只作为跨后端诊断，不再被误写成部署路由来源。
+
 导出阶段使用 CPU；完整模型和 checkpoint 专家验证使用 GPU 0。当前任务不是 TensorRT 性能测试，日志中的
 混合耗时仍只作诊断。
 
@@ -36,8 +39,10 @@ ASSET_REPO = WORKSPACE / "YOLO-Master"
 REPO = WORKSPACE / "YOLO-Master-deterministic-topk"
 REMOTE = "https://github.com/KennnMai/YOLO-Master.git"
 BRANCH = "rhino-a3-dev/smoke/a3"
-MINIMUM_COMMIT = "56325fe"
+MINIMUM_COMMIT = "aac33de"
 POLICY = "max_deadband_then_lowest_expert_id"
+ROUTE_AUTHORITY = "exported_router_host_topk"
+ROUTE_GATE_MODE = "exported_authoritative"
 
 CKPT = ASSET_REPO / "examples/artifacts/mot_v10_visdrone_50e/best_for_quantization.pt"
 IMAGE = WORKSPACE / "visdrone/images/val/0000364_01765_d_0000782.jpg"
@@ -212,7 +217,9 @@ for block in model_manifest["blocks"]:
     bundle_path = BUNDLES / block["bundle_manifest"]
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
     assert bundle["host_topk_tie_break"] == POLICY, (block["module_name"], bundle)
+    assert bundle["route_authority"] == ROUTE_AUTHORITY, (block["module_name"], bundle)
 print("6/6 bundles use:", POLICY, flush=True)
+print("6/6 bundles declare route authority:", ROUTE_AUTHORITY, flush=True)
 
 validation_command = [
     sys.executable,
@@ -232,7 +239,8 @@ validation_command = [
     "4",
     "--map-tolerance-pct-points",
     "0.5",
-    "--require-exact-route",
+    "--route-gate-mode",
+    ROUTE_GATE_MODE,
 ]
 validation_code = run_stream(validation_command, VAL_LOG)
 assert validation_code in (0, 2), f"程序异常退出 {validation_code}；查看：{VAL_LOG}"
@@ -249,7 +257,9 @@ print("dynamic mAP50-95:", gate["dynamic_mAP50_95"], flush=True)
 print("delta (percentage points):", gate["dynamic_minus_eager_percentage_points"], flush=True)
 print("route mismatch:", route["mismatched_locations"], "/", route["total_locations"], flush=True)
 print("accuracy gate:", gate["passed"], flush=True)
-print("exact-route gate:", route["passed"], flush=True)
+print("route gate mode:", route["mode"], flush=True)
+print("authoritative route gate:", route["authoritative_route"]["passed"], flush=True)
+print("eager reference exact match:", route["eager_reference"]["exact_match"], flush=True)
 print("dynamic execution gate:", dynamic["passed"], flush=True)
 
 metadata = {
@@ -258,6 +268,8 @@ metadata = {
     "branch": BRANCH,
     "checkpoint": {"path": str(CKPT), "sha256": sha256(CKPT)},
     "topk_policy": POLICY,
+    "route_authority": ROUTE_AUTHORITY,
+    "route_gate_mode": ROUTE_GATE_MODE,
     "python": sys.version,
     "platform": platform.platform(),
     "torch": torch.__version__,
@@ -286,12 +298,12 @@ print("证据包 SHA256：", sha256(EVIDENCE), flush=True)
 if validation_code == 2:
     print("注意：程序完整运行，但至少一个科学门禁失败；请保留并下载证据包。", flush=True)
 else:
-    print("确定性 Top-K 的 548 张严格门禁通过。", flush=True)
+    print("导出路由权威合同、精度和动态执行门禁通过；eager 路由漂移仍按原值报告。", flush=True)
 ```
 
 ## 结果判读
 
-- `return code = 0`：精度、严格零漂移和动态执行门禁全部通过。
+- `return code = 0`：精度、导出路由权威 dispatch 和动态执行门禁通过；不代表 eager/ORT 专家 ID 零漂移。
 - `return code = 2`：程序没有崩溃，但至少一个科学门禁失败；必须下载证据包分析，不能删除失败结果。
 - 其他返回码：环境或程序异常，先看实时输出和两个 `.log`。
 
